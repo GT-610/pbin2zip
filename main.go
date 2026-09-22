@@ -33,20 +33,28 @@ Commands:
   info    show container version, signature state, trailer, and ZIP contents
 
 Options:
-  -o string      output path (default: input with the other extension; "-" for stdout)
-  -sign string   RSA private key PEM (PKCS#1 or PKCS#8) used to sign the container
-  -version int   container version: 2 = final 2023 client (default), 1 = pre-2020
-  -l             list every ZIP entry (info)
+  -o string         output path (default: input with the other extension; "-" for stdout)
+  -sign string      RSA private key PEM (PKCS#1 or PKCS#8) used to sign the container
+  -template string  reuse the signature and trailer of an existing pbin; the
+                    result is verified against the official key, so an
+                    unmodified round trip reproduces a byte-identical file
+                    the stock client accepts
+  -build-number N   v2 trailer gate value the client expects (default 13881)
+  -version int      container version: 2 = final 2023 client (default), 1 = pre-2020
+  -l                list every ZIP entry (info)
 
 Envelope layout (all versions): 'PAN'+version header, 512-byte RSA-4096/SHA-1
 signature over everything after the prefix, the ZIP, then a trailer ending
-with the version byte — 1 byte for v1, 5 bytes for v2. The fixed 516-byte
-prefix is what "remove the first 516 bytes" strips:
+with the version byte — 1 byte for v1, 5 bytes for v2 (a gate value the
+client checks before the signature). The fixed 516-byte prefix is what
+"remove the first 516 bytes" strips:
 https://www.unknowncheats.me/forum/2157360-post2.html
 
 Note: the 2023 client verifies the signature with Valve's embedded (rotated)
-public key, so a container packed without Valve's private key fails that
-check; use -sign only for research against a patched verifier.
+public key, fail-closed. Unmodified round trips should use -template;
+modified content cannot satisfy a stock client without patching the
+verifier (panorama.dll FUN_10011f80, verify call at RVA 0x12548), so use
+-sign only for research against such a patched verifier.
 `
 
 func main() {
@@ -149,18 +157,32 @@ func cmdPack(args []string) error {
 	fs := newFlagSet("pack")
 	out := fs.String("o", "", "output pbin path (`-` for stdout)")
 	signPath := fs.String("sign", "", "RSA private key PEM used to sign the container")
+	template := fs.String("template", "", "reuse signature and trailer from this pbin (verified against the official key)")
+	buildNumber := fs.Uint("build-number", pbin.DefaultBuildNumber, "v2 trailer gate value the client expects")
 	version := fs.Int("version", int(pbin.DefaultVersion), "container version (2 = final 2023 client, 1 = pre-2020)")
 	if err := fs.Parse(args); err != nil {
-		return usageErrorf("%v\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem] [-version N] <file.zip | ->", err)
+		return usageErrorf("%v\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem | -template ref.pbin] [-build-number N] [-version N] <file.zip | ->", err)
 	}
 	if fs.NArg() != 1 {
-		return usageErrorf("pack expects exactly one input\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem] [-version N] <file.zip | ->")
+		return usageErrorf("pack expects exactly one input\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem | -template ref.pbin] [-build-number N] [-version N] <file.zip | ->")
 	}
 	if *version <= 0 || *version > 255 {
 		return usageErrorf("-version must be between 1 and 255, got %d", *version)
 	}
 	if *version != pbin.Version1 && *version != pbin.Version2 {
 		fmt.Fprintf(os.Stderr, "pbin2zip: warning: container version %d is not verified against any known client; output is best-effort\n", *version)
+	}
+	if *template != "" && *signPath != "" {
+		return usageErrorf("-template and -sign cannot be combined")
+	}
+	bnExplicit := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "build-number" {
+			bnExplicit = true
+		}
+	})
+	if bnExplicit && *version != pbin.Version2 {
+		return usageErrorf("-build-number only applies to version 2 (got -version %d)", *version)
 	}
 	in := fs.Arg(0)
 
@@ -174,7 +196,8 @@ func cmdPack(args []string) error {
 	}
 
 	var f *pbin.File
-	if *signPath != "" {
+	switch {
+	case *signPath != "":
 		keyPEM, err := os.ReadFile(*signPath)
 		if err != nil {
 			return fmt.Errorf("reading key %s: %w", *signPath, err)
@@ -187,12 +210,47 @@ func cmdPack(args []string) error {
 		if err != nil {
 			return err
 		}
-	} else {
+	case *template != "":
 		f, err = pbin.Pack(data, byte(*version))
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(os.Stderr, "pbin2zip: warning: packing with a zeroed signature; the game's integrity check will reject this container")
+		refData, err := os.ReadFile(*template)
+		if err != nil {
+			return fmt.Errorf("reading template %s: %w", *template, err)
+		}
+		ref, err := pbin.Parse(refData)
+		if err != nil {
+			return fmt.Errorf("template %s: %w", *template, err)
+		}
+		if ref.Version != f.Version {
+			return fmt.Errorf("template version %d does not match pack version %d", ref.Version, f.Version)
+		}
+		f.Signature = append([]byte(nil), ref.Signature...)
+		f.Trailer = append([]byte(nil), ref.Trailer...)
+		if f.Version == pbin.Version2 {
+			key, err := pbin.OfficialPublicKey()
+			if err != nil {
+				return err
+			}
+			if err := f.Verify(key); err != nil {
+				return fmt.Errorf("template envelope does not cover this ZIP: %w — the stock client would reject the output (input must be the template's original, unmodified ZIP)", err)
+			}
+			fmt.Fprintf(os.Stderr, "pbin2zip: template envelope verified against the official key; output is byte-identical to %s\n", displayName(*template))
+		} else {
+			fmt.Fprintf(os.Stderr, "pbin2zip: warning: template envelope copied but not verified (no embedded key for version %d)\n", f.Version)
+		}
+	default:
+		f, err = pbin.Pack(data, byte(*version))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "pbin2zip: warning: packing with a zeroed signature; the stock game will reject this container (use -template for unmodified round trips, or patch the verifier for research)")
+	}
+	if bnExplicit {
+		if err := f.SetBuildNumber(uint32(*buildNumber)); err != nil {
+			return err
+		}
 	}
 
 	blob, err := f.MarshalBinary()
@@ -254,6 +312,9 @@ func cmdInfo(args []string) error {
 	}
 	fmt.Printf("zip payload: %d bytes (prefix: %d, trailer: %d bytes, %s): %x\n",
 		len(f.Zip), pbin.OverheadSize, len(f.Trailer), trailerNote, f.Trailer)
+	if build, ok := f.BuildNumber(); ok {
+		fmt.Printf("gate value:  %d (0x%08x) — checked against INETSUPPORT_003 before the signature\n", build, build)
+	}
 
 	entries, err := f.ZipEntries()
 	if err != nil {

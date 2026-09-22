@@ -215,3 +215,76 @@ func TestRunExitCodes(t *testing.T) {
 		t.Errorf("undersized v1 pack: exit code = %d, want 0", code)
 	}
 }
+
+func TestRunPackBuildNumber(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := makeTestZip(t, dir)
+	pbn := filepath.Join(dir, "bn.pbin")
+
+	if code := run([]string{"pack", "-build-number", "4242", "-o", pbn, zipPath}); code != 0 {
+		t.Fatalf("pack exit code = %d, want 0", code)
+	}
+	blob, err := os.ReadFile(pbn)
+	if err != nil {
+		t.Fatalf("reading packed container: %v", err)
+	}
+	want := []byte{0x92, 0x10, 0x00, 0x00, pbin.Version2} //4242 = 0x1092, LE
+	if !bytes.Equal(blob[len(blob)-5:], want) {
+		t.Errorf("trailer = %x, want %x", blob[len(blob)-5:], want)
+	}
+
+	// The gate value only exists in v2 containers.
+	if code := run([]string{"pack", "-version", "1", "-build-number", "4242", zipPath}); code != 2 {
+		t.Errorf("build number with v1: exit code = %d, want 2", code)
+	}
+}
+
+func TestRunPackTemplate(t *testing.T) {
+	sample := filepath.Join("..", ".vscode", "code.pbin")
+	official, err := os.ReadFile(sample)
+	if err != nil {
+		t.Skipf("official code.pbin not available: %v", err)
+	}
+
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "code.zip")
+	if code := run([]string{"unpack", "-o", zipPath, sample}); code != 0 {
+		t.Fatalf("unpack exit code = %d, want 0", code)
+	}
+
+	// Unmodified round trip with -template must reproduce the official
+	// container byte for byte — that is what makes it stock-client safe.
+	repacked := filepath.Join(dir, "repacked.pbin")
+	if code := run([]string{"pack", "-template", sample, "-o", repacked, zipPath}); code != 0 {
+		t.Fatalf("pack -template exit code = %d, want 0", code)
+	}
+	got, err := os.ReadFile(repacked)
+	if err != nil {
+		t.Fatalf("reading repacked container: %v", err)
+	}
+	if !bytes.Equal(got, official) {
+		t.Fatalf("repacked container differs from the official file (%d vs %d bytes)", len(got), len(official))
+	}
+
+	// A modified ZIP must be rejected: the template signature would not
+	// cover it and the stock client would refuse the output.
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("panorama/other.xml")
+	if err != nil {
+		t.Fatalf("creating zip entry: %v", err)
+	}
+	if _, err := w.Write([]byte("<x/>")); err != nil {
+		t.Fatalf("writing zip entry: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing zip: %v", err)
+	}
+	modZip := filepath.Join(dir, "mod.zip")
+	if err := os.WriteFile(modZip, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("writing modified zip: %v", err)
+	}
+	if code := run([]string{"pack", "-template", sample, "-o", filepath.Join(dir, "mod.pbin"), modZip}); code != 1 {
+		t.Errorf("pack -template with modified zip: exit code = %d, want 1", code)
+	}
+}
