@@ -5,6 +5,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/rsa"
 	"crypto/sha256"
 	"errors"
 	"flag"
@@ -205,19 +206,26 @@ func cmdPack(args []string) error {
 		return fmt.Errorf("%s is not a valid ZIP archive: %w", displayName(in), err)
 	}
 
-	var f *pbin.File
-	templateVerified := false
-	switch {
-	case *signPath != "":
+	// Load the signing key up front; the envelope itself is built below and
+	// signed only after the gate rewrite, because the gate bytes are inside
+	// the signed range.
+	var signKey *rsa.PrivateKey
+	if *signPath != "" {
 		keyPEM, err := os.ReadFile(*signPath)
 		if err != nil {
 			return fmt.Errorf("reading key %s: %w", *signPath, err)
 		}
-		key, err := pbin.LoadPrivateKey(keyPEM)
+		signKey, err = pbin.LoadPrivateKey(keyPEM)
 		if err != nil {
 			return fmt.Errorf("loading key %s: %w", *signPath, err)
 		}
-		f, err = pbin.PackSigned(data, byte(*version), key)
+	}
+
+	var f *pbin.File
+	templateVerified := false
+	switch {
+	case *signPath != "":
+		f, err = pbin.Pack(data, byte(*version))
 		if err != nil {
 			return err
 		}
@@ -260,6 +268,15 @@ func cmdPack(args []string) error {
 	}
 	if bnExplicit {
 		if err := f.SetBuildNumber(uint32(*buildNumber)); err != nil {
+			return err
+		}
+	}
+	// Sign only now: the trailer's gate value is part of [516, EOF), so
+	// signing before the -build-number rewrite would leave the signature
+	// covering the pre-rewrite trailer and the client would reject the
+	// output.
+	if *signPath != "" {
+		if err := f.Sign(signKey); err != nil {
 			return err
 		}
 	}

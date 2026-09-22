@@ -324,9 +324,12 @@ func TestSignAndVerify(t *testing.T) {
 
 	for _, version := range []byte{Version1, Version2} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
-			f, err := PackSigned(zipData, version, key)
+			f, err := Pack(zipData, version)
 			if err != nil {
-				t.Fatalf("PackSigned: %v", err)
+				t.Fatalf("Pack: %v", err)
+			}
+			if err := f.Sign(key); err != nil {
+				t.Fatalf("Sign: %v", err)
 			}
 			if !f.IsSigned() {
 				t.Fatal("signed container reports unsigned")
@@ -345,9 +348,12 @@ func TestSignAndVerify(t *testing.T) {
 	}
 
 	// The trailer is inside the signed range: flipping a byte breaks it.
-	f, err := PackSigned(zipData, Version2, key)
+	f, err := Pack(zipData, Version2)
 	if err != nil {
-		t.Fatalf("PackSigned: %v", err)
+		t.Fatalf("Pack: %v", err)
+	}
+	if err := f.Sign(key); err != nil {
+		t.Fatalf("Sign: %v", err)
 	}
 	f.Trailer = append([]byte(nil), f.Trailer...)
 	f.Trailer[0] = 0xFF
@@ -360,8 +366,18 @@ func TestSignAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generating short RSA key: %v", err)
 	}
-	if _, err := PackSigned(zipData, Version2, shortKey); err == nil {
-		t.Fatal("PackSigned with 2048-bit key succeeded, want error")
+	if err := f.Sign(shortKey); err == nil {
+		t.Fatal("Sign with a 2048-bit key succeeded, want error")
+	}
+
+	// A missing key is a usage error, not a panic, and leaves the previous
+	// signature untouched.
+	saved := append([]byte(nil), f.Signature...)
+	if err := f.Sign(nil); err == nil {
+		t.Fatal("Sign(nil) succeeded, want error")
+	}
+	if !bytes.Equal(f.Signature, saved) {
+		t.Error("failed Sign(nil) modified the signature")
 	}
 }
 
