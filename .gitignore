@@ -1,0 +1,27 @@
+# Binaries
+/pbin2zip
+/pbin2zip.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Test artifacts
+/testdata/tmp/
+
+# Editors / IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
