@@ -63,7 +63,7 @@ Examples:
 ```console
 # code.pbin -> code.zip; the version is auto-detected from the header
 $ pbin2zip unpack code.pbin
-unpacked 18434112 bytes of ZIP (1103 entries) from code.pbin to code.zip \
+unpacked 4704000 bytes of ZIP (726 entries) from code.pbin to code.zip \
   (container version 2, 5-byte trailer)
 
 # inspect the container (version, signature state, trailer, entries)
@@ -99,8 +99,30 @@ $ pbin2zip unpack - < code.pbin > code.zip
   (PKCS#1 or PKCS#8 PEM, SHA-1 PKCS#1 v1.5 — exactly what `panzip` produces,
   over ZIP || trailer). Only useful for research against a patched verifier
   or for producing self-consistent fixtures.
-- The four non-version trailer bytes in v2 are never read back by any module
-  of the final client; `pack` writes them as zeros.
+- The four non-version trailer bytes in v2 are covered by the signature and
+  never read back by any module of the final client; see below.
+
+## Verified against the official sample
+
+All of the above was cross-checked against Valve's unmodified final
+`code.pbin` (4,704,521 bytes, 726 entries, trailer `39 36 00 00 02`):
+
+- it parses, re-marshals byte-identically, and unpacks to a working ZIP;
+- its signature verifies against the public key extracted from the shipped
+  `panorama.dll` — `tools/certcheck` reconstructs the 548-byte DER key from
+  Ghidra-captured instruction bytes — confirming the signed range
+  `[516, EOF)` = ZIP || trailer, SHA-1 PKCS#1 v1.5, and the rotated
+  4096-bit key (modulus starting `00 B0 9F D8 72`, **exponent 17**);
+- `internal/pbin.TestOfficialSample` repeats all of this automatically when
+  the sample is present at `.vscode/code.pbin` (game content, not committed;
+  override with `PBIN2ZIP_SAMPLE`) and skips otherwise.
+
+The four unknown trailer bytes are `39 36 00 00` in the official file. They
+are signed, unread by the client, and matched no candidate we tried:
+CRC32/CRC32C/Adler32 and CRC16 (ARC/CCITT/X.25/Kermit/Modbus, several init
+variants) over the ZIP, the central directory, the pre-EOCD region, the
+uncompressed concatenation, and per-entry CRC aggregates. `pack` therefore
+writes zeros there.
 
 ## Build and test
 
