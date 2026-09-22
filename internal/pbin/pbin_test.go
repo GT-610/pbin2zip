@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"testing"
 )
 
@@ -30,55 +31,149 @@ func buildZip(t *testing.T, files map[string]string) []byte {
 	return buf.Bytes()
 }
 
-func TestRoundTrip(t *testing.T) {
-	zipData := buildZip(t, map[string]string{
-		"panorama/layout.xml": "<root/>",
-		"panorama/styles.css": "body {}",
+func sampleZip(t *testing.T) []byte {
+	t.Helper()
+	return buildZip(t, map[string]string{
+		"panorama/layout.xml": "<root><panel class=\"x\"/></root>",
+		"panorama/styles.css": "body { color: red; }",
 		"panorama/script.js":  "const x = 1;",
 	})
+}
 
-	f := Pack(zipData, DefaultVersion)
-	if f.IsSigned() {
-		t.Fatal("freshly packed container claims to be signed")
+func TestRoundTrip(t *testing.T) {
+	zipData := sampleZip(t)
+
+	cases := []struct {
+		version     byte
+		trailerSize int
+	}{
+		{Version1, TrailerSizeV1},
+		{Version2, TrailerSizeV2},
 	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("v%d", tc.version), func(t *testing.T) {
+			f, err := Pack(zipData, tc.version)
+			if err != nil {
+				t.Fatalf("Pack: %v", err)
+			}
+			if f.IsSigned() {
+				t.Fatal("freshly packed container claims to be signed")
+			}
 
+			blob, err := f.MarshalBinary()
+			if err != nil {
+				t.Fatalf("MarshalBinary: %v", err)
+			}
+
+			wantLen := OverheadSize + len(zipData) + tc.trailerSize
+			if len(blob) != wantLen {
+				t.Fatalf("packed size = %d, want %d", len(blob), wantLen)
+			}
+			if blob[3] != tc.version || blob[len(blob)-1] != tc.version {
+				t.Fatalf("version byte mismatch: header %d, trailer %d, want %d",
+					blob[3], blob[len(blob)-1], tc.version)
+			}
+
+			// The 516-byte prefix trick: stripping it and the trailer must
+			// leave a ZIP that Go's standard reader accepts.
+			payload := blob[OverheadSize:]
+			zipBytes := payload[:len(payload)-tc.trailerSize]
+			if _, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes))); err != nil {
+				t.Fatalf("stripped payload is not a valid zip: %v", err)
+			}
+
+			parsed, err := Parse(blob)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if parsed.Version != tc.version {
+				t.Errorf("Version = %d, want %d", parsed.Version, tc.version)
+			}
+			if !bytes.Equal(parsed.Zip, zipData) {
+				t.Error("payload round trip mismatch")
+			}
+			if len(parsed.Trailer) != tc.trailerSize {
+				t.Errorf("len(Trailer) = %d, want %d", len(parsed.Trailer), tc.trailerSize)
+			}
+			if parsed.Trailer[len(parsed.Trailer)-1] != tc.version {
+				t.Errorf("trailer does not end with version byte %d", tc.version)
+			}
+			if parsed.IsSigned() {
+				t.Error("signature placeholder should parse as unsigned")
+			}
+			if len(parsed.Signature) != SignatureSize {
+				t.Errorf("len(Signature) = %d, want %d", len(parsed.Signature), SignatureSize)
+			}
+		})
+	}
+}
+
+func TestV2DefaultTrailer(t *testing.T) {
+	f, err := Pack(sampleZip(t), Version2)
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	if want := []byte{0, 0, 0, 0, Version2}; !bytes.Equal(f.Trailer, want) {
+		t.Errorf("v2 default trailer = %x, want %x", f.Trailer, want)
+	}
+}
+
+func TestParseAutoDetectsUnknownVersion(t *testing.T) {
+	// A version we have never seen still unpacks: the ZIP end is found via
+	// the end-of-central-directory record, and the odd-size trailer survives.
+	zipData := sampleZip(t)
+	f := &File{
+		Version:   3,
+		Signature: make([]byte, SignatureSize),
+		Zip:       zipData,
+		Trailer:   []byte{9, 9, 9, 9, 3},
+	}
 	blob, err := f.MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
-
-	wantLen := OverheadSize + len(zipData) + TrailerSize
-	if len(blob) != wantLen {
-		t.Fatalf("packed size = %d, want %d", len(blob), wantLen)
+	parsed, err := Parse(blob)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
 	}
-
-	// The 516-byte prefix trick from the unknowncheats post: stripping it must
-	// leave a ZIP that Go's standard reader accepts.
-	stripped := blob[OverheadSize:]
-	if _, err := zip.NewReader(bytes.NewReader(stripped[:len(stripped)-1]), int64(len(stripped)-1)); err != nil {
-		t.Fatalf("stripped payload is not a valid zip: %v", err)
+	if parsed.Version != 3 {
+		t.Errorf("Version = 3 mismatch: got %d", parsed.Version)
 	}
+	if !bytes.Equal(parsed.Zip, zipData) {
+		t.Error("payload round trip mismatch for unknown version")
+	}
+	if !bytes.Equal(parsed.Trailer, f.Trailer) {
+		t.Errorf("trailer = %x, want %x", parsed.Trailer, f.Trailer)
+	}
+}
+
+func TestParseToleratesMislabeledTrailer(t *testing.T) {
+	// Header claims v1 (1-byte trailer) but five bytes follow the ZIP: the
+	// exact-size probe misses and the EOCD fallback still unpacks the file.
+	zipData := sampleZip(t)
+	blob := make([]byte, 0, OverheadSize+len(zipData)+TrailerSizeV2)
+	blob = append(blob, 'P', 'A', 'N', Version1)
+	blob = append(blob, make([]byte, SignatureSize)...)
+	blob = append(blob, zipData...)
+	blob = append(blob, 0, 0, 0, 0, Version1)
 
 	parsed, err := Parse(blob)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if parsed.Version != DefaultVersion {
-		t.Errorf("Version = %d, want %d", parsed.Version, DefaultVersion)
-	}
 	if !bytes.Equal(parsed.Zip, zipData) {
 		t.Error("payload round trip mismatch")
 	}
-	if parsed.IsSigned() {
-		t.Error("signature placeholder should parse as unsigned")
-	}
-	if len(parsed.Signature) != SignatureSize {
-		t.Errorf("len(Signature) = %d, want %d", len(parsed.Signature), SignatureSize)
+	if len(parsed.Trailer) != TrailerSizeV2 {
+		t.Errorf("len(Trailer) = %d, want %d (fallback)", len(parsed.Trailer), TrailerSizeV2)
 	}
 }
 
 func TestParseRejects(t *testing.T) {
-	valid := Pack(buildZip(t, map[string]string{"a.txt": "a"}), DefaultVersion)
+	valid, err := Pack(sampleZip(t), DefaultVersion)
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
 	validBlob, err := valid.MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
@@ -90,14 +185,17 @@ func TestParseRejects(t *testing.T) {
 	}{
 		{"too short", []byte("PAN\x01")},
 		{"bad magic", bytes.Repeat([]byte("XZQ"), 300)},
-		{"version mismatch", func() []byte {
+		{"trailer byte mismatch", func() []byte {
 			b := append([]byte(nil), validBlob...)
-			b[len(b)-1] = 0x02
+			b[len(b)-1] = 0x09
 			return b
 		}()},
-		{"payload not a zip", append([]byte{'P', 'A', 'N', 0x01},
-			append(bytes.Repeat([]byte{0xAA}, SignatureSize),
-				append(bytes.Repeat([]byte{0xBB}, 64), 0x01)...)...)},
+		{"payload not a zip", append([]byte{'P', 'A', 'N', Version1},
+			append(bytes.Repeat([]byte{0}, SignatureSize),
+				append(bytes.Repeat([]byte{0xBB}, 64), Version1)...)...)},
+		{"payload without EOCD", append([]byte{'P', 'A', 'N', Version1},
+			append(bytes.Repeat([]byte{0}, SignatureSize),
+				append(append([]byte{'P', 'K', 0x03, 0x04}, bytes.Repeat([]byte{0xAA}, 100)...), Version1)...)...)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -108,29 +206,71 @@ func TestParseRejects(t *testing.T) {
 	}
 
 	if _, err := Parse(validBlob[:len(validBlob)-8]); err == nil {
-		// Truncating the payload keeps the magic but breaks both the trailing
-		// version byte check and the ZIP check; either way it must fail.
+		// Truncation breaks the trailing version-byte and/or ZIP checks.
 		t.Fatal("Parse of truncated blob succeeded, want error")
 	}
 }
 
 func TestMarshalRejectsInvalidFields(t *testing.T) {
-	zipData := buildZip(t, map[string]string{"a.txt": "a"})
+	zipData := sampleZip(t)
 
-	f := Pack(zipData, DefaultVersion)
+	f, err := Pack(zipData, DefaultVersion)
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
 	f.Signature = f.Signature[:8]
 	if _, err := f.MarshalBinary(); err == nil {
 		t.Error("MarshalBinary with short signature succeeded, want error")
 	}
 
-	f = Pack(zipData, 0)
+	f, err = Pack(zipData, Version1)
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	f.Version = 0
 	if _, err := f.MarshalBinary(); err == nil {
 		t.Error("MarshalBinary with version 0 succeeded, want error")
 	}
 
-	f = Pack([]byte("not a zip"), DefaultVersion)
+	f = &File{Version: Version1, Signature: make([]byte, SignatureSize), Zip: []byte("not a zip"), Trailer: []byte{Version1}}
 	if _, err := f.MarshalBinary(); err == nil {
 		t.Error("MarshalBinary with non-zip payload succeeded, want error")
+	}
+
+	f, err = Pack(zipData, Version1)
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	f.Trailer = nil
+	if _, err := f.MarshalBinary(); err == nil {
+		t.Error("MarshalBinary with empty trailer succeeded, want error")
+	}
+
+	f.Trailer = []byte{0, 1} // v1 requires exactly one trailer byte
+	if _, err := f.MarshalBinary(); err == nil {
+		t.Error("MarshalBinary with oversized v1 trailer succeeded, want error")
+	}
+
+	f.Trailer = []byte{Version2} // last byte must match the version
+	if _, err := f.MarshalBinary(); err == nil {
+		t.Error("MarshalBinary with trailer not ending in version byte succeeded, want error")
+	}
+}
+
+func TestPackEnforcesMinSizeV2(t *testing.T) {
+	// An empty zip (EOCD only, 22 bytes) yields a container below the final
+	// client's 581-byte floor; version 1 has no such constraint.
+	var buf bytes.Buffer
+	if err := zip.NewWriter(&buf).Close(); err != nil {
+		t.Fatalf("building empty zip: %v", err)
+	}
+	emptyZip := buf.Bytes()
+
+	if _, err := Pack(emptyZip, Version2); err == nil {
+		t.Fatal("Pack v2 with undersized payload succeeded, want error")
+	}
+	if _, err := Pack(emptyZip, Version1); err != nil {
+		t.Fatalf("Pack v1 with small payload: %v", err)
 	}
 }
 
@@ -139,24 +279,39 @@ func TestSignAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generating RSA key: %v", err)
 	}
+	zipData := sampleZip(t)
 
-	zipData := buildZip(t, map[string]string{"panorama/layout.xml": "<root/>"})
-	f, err := PackSigned(zipData, DefaultVersion, key)
+	for _, version := range []byte{Version1, Version2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			f, err := PackSigned(zipData, version, key)
+			if err != nil {
+				t.Fatalf("PackSigned: %v", err)
+			}
+			if !f.IsSigned() {
+				t.Fatal("signed container reports unsigned")
+			}
+			if err := f.Verify(&key.PublicKey); err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+
+			// Tampering with the payload must break verification.
+			f.Zip = append([]byte(nil), f.Zip...)
+			copy(f.Zip[10:], "TAMPERED")
+			if err := f.Verify(&key.PublicKey); err == nil {
+				t.Fatal("Verify succeeded on tampered payload, want failure")
+			}
+		})
+	}
+
+	// The trailer is inside the signed range: flipping a byte breaks it.
+	f, err := PackSigned(zipData, Version2, key)
 	if err != nil {
 		t.Fatalf("PackSigned: %v", err)
 	}
-	if !f.IsSigned() {
-		t.Fatal("signed container reports unsigned")
-	}
-	if err := f.Verify(&key.PublicKey); err != nil {
-		t.Fatalf("Verify: %v", err)
-	}
-
-	// Tampering with the payload must break verification.
-	f.Zip = append([]byte(nil), f.Zip...)
-	copy(f.Zip[10:], "TAMPERED")
+	f.Trailer = append([]byte(nil), f.Trailer...)
+	f.Trailer[0] = 0xFF
 	if err := f.Verify(&key.PublicKey); err == nil {
-		t.Fatal("Verify succeeded on tampered payload, want failure")
+		t.Fatal("Verify succeeded on tampered trailer, want failure")
 	}
 
 	// A short key cannot produce the fixed 512-byte signature field.
@@ -164,7 +319,7 @@ func TestSignAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generating short RSA key: %v", err)
 	}
-	if _, err := PackSigned(zipData, DefaultVersion, shortKey); err == nil {
+	if _, err := PackSigned(zipData, Version2, shortKey); err == nil {
 		t.Fatal("PackSigned with 2048-bit key succeeded, want error")
 	}
 }
@@ -210,7 +365,11 @@ func TestZipEntries(t *testing.T) {
 		"panorama/layout.xml": "<root/>",
 		"panorama/styles.css": "body {}",
 	})
-	entries, err := Pack(zipData, DefaultVersion).ZipEntries()
+	f, err := Pack(zipData, DefaultVersion)
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	entries, err := f.ZipEntries()
 	if err != nil {
 		t.Fatalf("ZipEntries: %v", err)
 	}
