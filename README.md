@@ -105,8 +105,10 @@ $ pbin2zip unpack - < code.pbin > code.zip
 - **pack** guarantees only the 2023 format (version 2); envelope size,
   trailer, and the 581-byte minimum are enforced. `-version 1` is also fully
   supported; any other version packs best-effort with a warning.
-- **verify** applies the stock client's checks in its own order and reports
-  each failing one; exit status 0 means the final client would load the file.
+- **verify** applies the stock client's checks in its own order (the
+  581-byte minimum, the version-2 envelope, the gate value, the official
+  signature) and reports each failing one; exit status 0 means the final
+  client would load the file.
 
 ### Signature notes
 

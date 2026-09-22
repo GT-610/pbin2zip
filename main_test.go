@@ -3,8 +3,10 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/GT-610/pbin2zip/internal/pbin"
@@ -36,6 +38,29 @@ func makeTestZip(t *testing.T, dir string) string {
 		t.Fatalf("writing zip file: %v", err)
 	}
 	return path
+}
+
+// captureStderr runs fn with os.Stderr redirected into a pipe and returns
+// everything fn wrote to it, so tests can assert on diagnostic messages.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating stderr pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing stderr pipe: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		t.Fatalf("reading captured stderr: %v", err)
+	}
+	return string(out)
 }
 
 func TestReplaceExt(t *testing.T) {
@@ -367,6 +392,34 @@ func TestRunVerify(t *testing.T) {
 	}
 	if code := run([]string{"verify", v1Path}); code != 1 {
 		t.Errorf("verify v1 container: exit code = %d, want 1", code)
+	}
+
+	// A v2 container below the client's 581-byte floor must be reported as
+	// undersized, not merely fail on the zeroed signature. An empty ZIP
+	// (22-byte EOCD) plus the v2 envelope and trailer is 543 bytes: well
+	// above the parser's 517-byte structural minimum, below the client's.
+	var eocd bytes.Buffer
+	if err := zip.NewWriter(&eocd).Close(); err != nil {
+		t.Fatalf("building empty zip: %v", err)
+	}
+	small := make([]byte, 0, pbin.OverheadSize+eocd.Len()+pbin.TrailerSizeV2)
+	small = append(small, 'P', 'A', 'N', pbin.Version2)
+	small = append(small, make([]byte, pbin.SignatureSize)...)
+	small = append(small, eocd.Bytes()...)
+	small = append(small, 0x39, 0x36, 0x00, 0x00, pbin.Version2) // official gate, correct version byte
+	smallPath := filepath.Join(dir, "small.pbin")
+	if err := os.WriteFile(smallPath, small, 0o644); err != nil {
+		t.Fatalf("writing undersized container: %v", err)
+	}
+	code := -1
+	errText := captureStderr(t, func() {
+		code = run([]string{"verify", smallPath})
+	})
+	if code != 1 {
+		t.Errorf("verify undersized v2: exit code = %d, want 1", code)
+	}
+	if !strings.Contains(errText, "581") {
+		t.Errorf("verify undersized v2 did not report the 581-byte minimum, stderr:\n%s", errText)
 	}
 
 	// The official sample must pass every check.

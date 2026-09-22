@@ -33,8 +33,9 @@ Commands:
           (version 2) by default; zeroed signature unless -sign
   info    show container version, signature state, trailer, and ZIP contents
   verify  check a container the way the stock final 2023 client would:
-          version-2 envelope, gate value 13881, official RSA signature;
-          exit 0 when the client would load it, exit 1 when it would not
+          at least 581 bytes, version-2 envelope, gate value 13881,
+          official RSA signature; exit 0 when the client would load it,
+          exit 1 when it would not
 
 Options:
   -o string         output path (default: input with the other extension; "-" for stdout)
@@ -363,8 +364,9 @@ func cmdInfo(args []string) error {
 }
 
 // cmdVerify checks a container against exactly what the stock final (2023)
-// client enforces, in the client's own order: a version-2 envelope, the gate
-// value INETSUPPORT_003 reports (13881 for the frozen build), and a valid
+// client enforces, in the client's own order: a file of at least 581 bytes
+// (CMP ECX,0x245 in FUN_10011f80), a version-2 envelope, the gate value
+// INETSUPPORT_003 reports (13881 for the frozen build), and a valid
 // signature under Valve's embedded public key. Exit status 0 means the
 // client would accept the file, 1 means it would reject it.
 func cmdVerify(args []string) error {
@@ -387,6 +389,10 @@ func cmdVerify(args []string) error {
 	}
 
 	var problems []string
+	if len(data) < pbin.MinSizeV2 {
+		problems = append(problems, fmt.Sprintf("file is %d bytes, the final client requires at least %d",
+			len(data), pbin.MinSizeV2))
+	}
 	if f.Version != pbin.Version2 {
 		problems = append(problems, fmt.Sprintf("container version %d%s — the final client only reads version 2",
 			f.Version, versionLabel(f.Version)))
