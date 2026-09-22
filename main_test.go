@@ -237,6 +237,25 @@ func TestRunPackBuildNumber(t *testing.T) {
 	if code := run([]string{"pack", "-version", "1", "-build-number", "4242", zipPath}); code != 2 {
 		t.Errorf("build number with v1: exit code = %d, want 2", code)
 	}
+
+	// Values that do not fit the trailer's little-endian uint32 must be
+	// rejected instead of silently truncated on the uint32 cast.
+	if code := run([]string{"pack", "-build-number", "4294967296", zipPath}); code != 2 {
+		t.Errorf("overflowing build number: exit code = %d, want 2", code)
+	}
+
+	// The largest legal value round-trips into the trailer.
+	maxPbn := filepath.Join(dir, "max.pbin")
+	if code := run([]string{"pack", "-build-number", "4294967295", "-o", maxPbn, zipPath}); code != 0 {
+		t.Fatalf("pack -build-number 4294967295 exit code = %d, want 0", code)
+	}
+	blob, err = os.ReadFile(maxPbn)
+	if err != nil {
+		t.Fatalf("reading packed container: %v", err)
+	}
+	if want := []byte{0xff, 0xff, 0xff, 0xff, pbin.Version2}; !bytes.Equal(blob[len(blob)-5:], want) {
+		t.Errorf("max gate trailer = %x, want %x", blob[len(blob)-5:], want)
+	}
 }
 
 func TestRunPackTemplate(t *testing.T) {

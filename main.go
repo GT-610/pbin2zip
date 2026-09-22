@@ -164,13 +164,16 @@ func cmdPack(args []string) error {
 	out := fs.String("o", "", "output pbin path (`-` for stdout)")
 	signPath := fs.String("sign", "", "RSA private key PEM used to sign the container")
 	template := fs.String("template", "", "reuse signature and trailer from this pbin (verified against the official key)")
-	buildNumber := fs.Uint("build-number", pbin.DefaultBuildNumber, "v2 trailer gate value the client expects")
+	buildNumber := fs.Uint64("build-number", pbin.DefaultBuildNumber, "v2 trailer gate value the client expects")
 	version := fs.Int("version", int(pbin.DefaultVersion), "container version (2 = final 2023 client, 1 = pre-2020)")
 	if err := fs.Parse(args); err != nil {
 		return usageErrorf("%v\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem | -template ref.pbin] [-build-number N] [-version N] <file.zip | ->", err)
 	}
 	if fs.NArg() != 1 {
 		return usageErrorf("pack expects exactly one input\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem | -template ref.pbin] [-build-number N] [-version N] <file.zip | ->")
+	}
+	if *buildNumber > uint64(^uint32(0)) {
+		return usageErrorf("-build-number must be between 0 and 4294967295, got %d", *buildNumber)
 	}
 	if *version <= 0 || *version > 255 {
 		return usageErrorf("-version must be between 1 and 255, got %d", *version)
