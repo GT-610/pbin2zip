@@ -5,8 +5,8 @@ from standard ZIP archives.
 
 In CS:GO the Panorama UI ships as `csgo/panorama/code.pbin`. Despite the
 `.pbin` extension it is a plain ZIP file wrapped in a small signed envelope,
-so any archive tool can open it once the wrapper is stripped — the trick
-described in [this unknowncheats post](https://www.unknowncheats.me/forum/2157360-post2.html):
+so any archive tool can open it once the wrapper is stripped, which is the
+trick described in [this unknowncheats post](https://www.unknowncheats.me/forum/2157360-post2.html):
 "remove the first 516 bytes in the file".
 
 ## Container format
@@ -50,7 +50,7 @@ SUB  EAX, 0x209                ; ZIP length = total-521 → 5-byte trailer
 
 Stripping the fixed `516`-byte prefix and cutting at the ZIP's
 end-of-central-directory record therefore yields a byte-identical,
-warning-free ZIP — for version 1, version 2, and unknown versions alike.
+warning-free ZIP, for version 1, version 2, and unknown versions alike.
 
 ## Usage
 
@@ -73,7 +73,7 @@ unpacked 4704000 bytes of ZIP (726 entries) from code.pbin to code.zip \
 $ pbin2zip info -l code.pbin
 
 # check a container exactly the way the stock final client would:
-# version 2, gate 13881, official signature — exit 0 = accepted
+# version 2, gate 13881, official signature; exit 0 = accepted
 $ pbin2zip verify code.pbin
 code.pbin: accepted — version 2, gate 13881, official signature valid
 
@@ -102,7 +102,7 @@ $ pbin2zip unpack - < code.pbin > code.zip
   end-of-central-directory record, so v1, v2, and unknown versions all
   unpack. Versions with a trailer size we have never seen are unpacked on a
   best-effort basis.
-- **pack** guarantees only the **2023 format (version 2)** — envelope size,
+- **pack** guarantees only the 2023 format (version 2); envelope size,
   trailer, and the 581-byte minimum are enforced. `-version 1` is also fully
   supported; any other version packs best-effort with a warning.
 - **verify** applies the stock client's checks in its own order and reports
@@ -115,7 +115,7 @@ $ pbin2zip unpack - < code.pbin > code.zip
   since-rotated public key with mandatory fail-closed checking, so a repacked
   container fails that check.
 - `-sign key.pem` signs the container with your own 4096-bit RSA key
-  (PKCS#1 or PKCS#8 PEM, SHA-1 PKCS#1 v1.5 — exactly what `panzip` produces,
+  (PKCS#1 or PKCS#8 PEM, SHA-1 PKCS#1 v1.5, exactly what `panzip` produces,
   over ZIP || trailer). Only useful for research against a patched verifier
   or for producing self-consistent fixtures.
 - The four non-version trailer bytes in v2 are covered by the signature and
@@ -127,7 +127,7 @@ $ pbin2zip unpack - < code.pbin > code.zip
 ### Will the stock 2023 client read a packed file?
 
 Run `pbin2zip verify <file.pbin>` to check any container against exactly the
-rules below (exit 0 = accepted). In detail:
+rules below (exit 0 = accepted).
 
 - **Unmodified round trip: yes.** `pack -template` copies the official
   envelope and verifies it against the embedded official key, so the output
@@ -136,8 +136,8 @@ rules below (exit 0 = accepted). In detail:
 - **Modified ZIP: not without patching the client.** The parser runs a
   mandatory, fail-closed RSA verify (`FUN_10011f80`, verify call at
   `panorama.dll` RVA `0x12548`) against Valve's rotated private-key
-  counterpart, which we do not have. Research setups patch the client —
-  e.g. replace that 5-byte `CALL` with `B8 01 00 00 00` (`MOV EAX,1`) —
+  counterpart, which we do not have. Research setups patch the client,
+  e.g. by replacing that 5-byte `CALL` with `B8 01 00 00 00` (`MOV EAX,1`),
   or swap the embedded certificate; `-sign` then signs with your key.
 - Both cases still need the gate value correct (default 13881, tunable via
   `-build-number`) and legal resource names/paths inside the ZIP: the
@@ -145,20 +145,19 @@ rules below (exit 0 = accepted). In detail:
 
 ### Where is the private key?
 
-Nowhere reachable — stated plainly, because we looked rather than assumed.
-The signing half of Valve's panorama-pack key was never shipped, never
-leaked, and cannot be derived:
+Nowhere reachable. We looked, and the signing half of Valve's
+panorama-pack key was never shipped, never leaked, and cannot be derived:
 
-- **The leaked source names the file but does not contain it.**
+- The leaked source names the file but does not contain it.
   `utils/panzip/panzip.cpp` includes
   `devtools/bin/certificates/panoramapack.private.h` directly into the
   packer and signs with it (`launcher_keypair_signdata`). The leaked
   `csgo_partner` tree only ships the matching `panoramapack.public.h`
   (the 2019 key, modulus starting `C3 77 62 5E`); a filesystem-wide
   search for `panoramapack*` finds no `.private.h` anywhere.
-- **No shipped binary contains a PEM private key.** A case-insensitive
-  byte scan for `PRIVATE KEY` — which covers every PEM private-key label,
-  including `RSA PRIVATE KEY` and `PRIVATE KEY` — plus `BEGIN RSA`, over
+- No shipped binary contains a PEM private key. A case-insensitive
+  byte scan for `PRIVATE KEY` (which covers every PEM private-key label,
+  including `RSA PRIVATE KEY` and `PRIVATE KEY`) plus `BEGIN RSA`, over
   the installed game's DLLs and EXEs, hits only crypto-library label
   tables: OpenSSL's PEM names in `video.dll`, libssh's
   `-----BEGIN OPENSSH PRIVATE KEY-----` template in
@@ -167,27 +166,27 @@ leaked, and cannot be derived:
   `panorama.dll`, `panoramauiclient.dll`, `client.dll`, and `csgo.exe`
   have zero hits, and `engine.dll` contains no `-----BEGIN` PEM header
   at all.
-- **What the client embeds is only the public half.** The blob
-  reconstructed from `panorama.dll` (`tools/certcheck`) is a 548-byte
-  SubjectPublicKeyInfo — modulus plus exponent 17. A 4096-bit private key
+- What the client embeds is only the public half. The blob reconstructed
+  from `panorama.dll` (`tools/certcheck`) is a 548-byte
+  SubjectPublicKeyInfo: modulus plus exponent 17. A 4096-bit private key
   is a ~2.4 KB structure of nine INTEGERs (`d`, `p`, `q`, `dP`, `dQ`,
   `qInv`, …); no structure of that shape exists in the binary.
-- **It could not be derived either.** The client only verifies, so it
+- It could not be derived either. The client only verifies, so it
   needs only the public half; recovering the private exponent from a
   4096-bit modulus means factoring that modulus, which is not feasible.
   And shipping the private key would let anyone sign an arbitrary
-  `code.pbin`, defeating the check — which is why it exists only in
+  `code.pbin`, defeating the check, which is why it exists only in
   Valve's build tree.
-- **Even the 2019 private key would not help the 2023 client.** The key
+- Even the 2019 private key would not help the 2023 client. The key
   rotated (`C3 77 62 5E …` → `B0 9F D8 72 …`, an entirely different
   modulus), so a recovered old key could only sign version-1 containers
   for pre-2020 clients.
 
-Consequences, honestly: a modified ZIP can **never** satisfy the stock
-2023 verifier — the routes above are patching the verifier or swapping
-the embedded certificate, after which `-sign` produces signatures valid
-only under your own key or patched client. The only stock-safe repack
-remains `pack -template` with byte-identical, unmodified content.
+A modified ZIP can never satisfy the stock 2023 verifier; the routes above
+are patching the verifier or swapping the embedded certificate, after which
+`-sign` produces signatures valid only under your own key or a patched
+client. The only stock-safe repack remains `pack -template` with
+byte-identical, unmodified content.
 
 ## Verified against the official sample
 
@@ -198,22 +197,22 @@ All of the above was cross-checked against Valve's unmodified final
 - it is byte-identical (same SHA-256) to the `code.pbin` shipped in a stock
   Steam install of CS:GO Legacy, so the sample is provably unmodified;
 - its signature verifies against the public key extracted from the shipped
-  `panorama.dll` — `tools/certcheck` reconstructs the 548-byte DER key from
-  Ghidra-captured instruction bytes — confirming the signed range
+  `panorama.dll` (`tools/certcheck` reconstructs the 548-byte DER key from
+  Ghidra-captured instruction bytes), confirming the signed range
   `[516, EOF)` = ZIP || trailer, SHA-1 PKCS#1 v1.5, and the rotated
-  4096-bit key (modulus starting `00 B0 9F D8 72`, **exponent 17**);
+  4096-bit key (modulus starting `00 B0 9F D8 72`, exponent 17);
 - `internal/pbin.TestOfficialSample` repeats all of this automatically when
   the sample is present at `.vscode/code.pbin` (game content, not committed;
   override with `PBIN2ZIP_SAMPLE`) and skips otherwise.
 
-The four trailer bytes are `39 36 00 00` — a little-endian uint32 of
-**13881**, not a content checksum: the parser seeks to `size-5`, reads them
+The four trailer bytes are `39 36 00 00`, a little-endian uint32 of
+13881, not a content checksum: the parser seeks to `size-5`, reads them
 back, and compares them against the value `INETSUPPORT_003` reports, rejecting
 the file before the signature check if they differ (CRC32/CRC32C/Adler32 and
 CRC16 families over the ZIP, central directory, pre-EOCD region, uncompressed
 concatenation, and per-entry CRC aggregates all failed to match, confirming
-they are a gate value rather than a hash). `pack` writes 13881 by default —
-the value the frozen 2023 build expects — overridable with `-build-number`.
+they are a gate value rather than a hash). `pack` writes 13881 by default
+(the value the frozen 2023 build expects), overridable with `-build-number`.
 
 ## Build and test
 
@@ -226,9 +225,9 @@ Requires Go 1.24+; no third-party dependencies.
 
 ## Related projects
 
-- `CSGOPanorama` — dumps of the source extracted from `code.pbin` for every
+- `CSGOPanorama`: dumps of the source extracted from `code.pbin` for every
   Panorama-era CS:GO version.
-- `csgo_gc` — GC support for the discontinued CS:GO.
+- `csgo_gc`: GC support for the discontinued CS:GO.
 
 ## License
 
