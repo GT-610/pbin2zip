@@ -1,22 +1,35 @@
 // Package pbin implements reading and writing of Panorama .pbin containers.
 //
 // A .pbin is the packaged Panorama UI archive shipped with CS:GO as
-// csgo/panorama/code.pbin. Valve's own panzip tool builds it, and the engine
-// verifies it before mounting the embedded ZIP. The on-disk layout is:
+// csgo/panorama/code.pbin. Despite the extension it is a regular ZIP file
+// wrapped in a small signed envelope, which is why stripping the fixed
+// 516-byte prefix yields an openable archive, as described at
+// https://www.unknowncheats.me/forum/2157360-post2.html
+//
+// Layout common to all versions:
 //
 //	offset  size  contents
-//	0       4     header: 'P', 'A', 'N', version (currently 1)
-//	4       512   RSA-4096 PKCS#1 v1.5 SHA-1 signature over (zip || version)
+//	0       4     header: 'P', 'A', 'N', version
+//	4       512   RSA-4096 PKCS#1 v1.5 SHA-1 signature over bytes [516, EOF)
 //	516     n     a standard ZIP archive
-//	516+n   1     version byte again, covered by the signature
+//	516+n   t     trailer of t bytes, always ending with the version byte
 //
-// Because the 4-byte header plus the 512-byte signature is a fixed 516-byte
-// prefix, stripping it yields a regular ZIP file, which is exactly the trick
-// described at https://www.unknowncheats.me/forum/2157360-post2.html
+// Two versions are known:
 //
-// Reference: utils/panzip/panzip.cpp (writer) and
-// panorama/source2/panoramauiengine.cpp (PanoramaResourceFileIntegrityCheck,
-// reader) from the leaked CS:GO source tree.
+//   - Version 1 (CS:GO up to 2019, PANORAMA_ZIPFILE_VERSION in the leaked
+//     source): t = 1, total overhead 517 bytes. See
+//     utils/panzip/panzip.cpp (writer) and panorama/source2/
+//     panoramauiengine.cpp (PanoramaResourceFileIntegrityCheck, reader).
+//   - Version 2 (final 2023 client): t = 5 — four bytes of unknown purpose
+//     (never read back by any module) plus the version byte — total overhead
+//     521 bytes, minimum file size 581. Verified in the shipped
+//     panorama.dll parser (FUN_10011f80): magic 0x024E4150, payload at
+//     +0x204, length total-0x209, trailing byte == 2, mandatory RSA verify
+//     with a rotated public key (modulus starting 00 B0 9F D8 72...).
+//
+// Unpacking auto-detects the version from the header and locates the ZIP end
+// via the end-of-central-directory record, so it also copes with versions we
+// have never seen. Packing only guarantees the 2023 (version 2) format.
 package pbin
 
 import (
@@ -27,6 +40,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -36,45 +50,106 @@ const (
 	// HeaderSize is the size of the fixed 'PAN'+version header.
 	HeaderSize = 4
 
-	// SignatureSize is the size of the RSA signature. Valve's verifier hardcodes
-	// 512 bytes (a 4096-bit RSA key); panzip writes exactly that much.
+	// SignatureSize is the size of the RSA signature. The final client's
+	// verifier hardcodes 512 bytes (a 4096-bit RSA key) — see the 0x200
+	// length passed to the verify helper from FUN_10011f80.
 	SignatureSize = 512
 
-	// OverheadSize is the fixed prefix preceding the ZIP blob (header + signature).
-	// Removing this many bytes from a .pbin produces a plain ZIP file.
+	// OverheadSize is the fixed prefix preceding the ZIP blob (header +
+	// signature). Removing it from a .pbin leaves ZIP plus trailer.
 	OverheadSize = HeaderSize + SignatureSize // 516
 
-	// TrailerSize is the trailing version byte after the ZIP blob.
-	TrailerSize = 1
+	// Version1 is the container version used by CS:GO up to 2019.
+	Version1 = 1
 
-	// MinSize is the smallest possible .pbin: header + signature + trailer.
-	MinSize = OverheadSize + TrailerSize // 517
+	// Version2 is the container version used by the final (2023) client.
+	Version2 = 2
 
-	// DefaultVersion is the container version used by current CS:GO builds.
-	DefaultVersion = 1
+	// DefaultVersion targets packing at the final 2023 client.
+	DefaultVersion = Version2
+
+	// TrailerSizeV1: the version byte only.
+	TrailerSizeV1 = 1
+
+	// TrailerSizeV2: four bytes of unknown purpose plus the version byte.
+	// The final client's parser computes the payload length as total-0x209
+	// while the payload starts at +0x204, leaving exactly 5 trailing bytes.
+	TrailerSizeV2 = 5
+
+	// MinSizeV2 is the smallest file the final client accepts
+	// (CMP ECX,0x245 in FUN_10011f80).
+	MinSizeV2 = 0x245 // 581
+
+	// MinSize is the smallest possible .pbin overall (version-1 envelope).
+	MinSize = OverheadSize + TrailerSizeV1 // 517
 )
 
 // magic is the 'PAN' prefix of the header.
 var magic = [3]byte{'P', 'A', 'N'}
 
+// Accepted starts of a ZIP payload.
+var (
+	localHeaderSig = []byte{'P', 'K', 0x03, 0x04}
+	emptyZipSig    = []byte{'P', 'K', 0x05, 0x06}
+)
+
+// eocdSig is the ZIP end-of-central-directory signature, used to locate the
+// exact end of the ZIP payload regardless of container version.
+var eocdSig = []byte{'P', 'K', 0x05, 0x06}
+
 // ErrNotPbin is returned by Parse when the data does not start with 'PAN'.
 var ErrNotPbin = errors.New("not a pbin container: missing \"PAN\" magic")
 
-// File is a parsed .pbin container.
-type File struct {
-	// Version is the container version, stored both in the header and in the
-	// trailing byte, and covered by the signature.
-	Version byte
-
-	// Signature is the RSA-4096 PKCS#1 v1.5 SHA-1 signature over (Zip || Version).
-	// For containers packed without Valve's private key it is a zero placeholder.
-	Signature []byte
-
-	// Zip is the raw ZIP archive payload, verbatim.
-	Zip []byte
+// ExpectedTrailerSize returns how many bytes follow the ZIP payload for a
+// known container version, or -1 when the version is unknown.
+func ExpectedTrailerSize(version byte) int {
+	switch version {
+	case Version1:
+		return TrailerSizeV1
+	case Version2:
+		return TrailerSizeV2
+	default:
+		return -1
+	}
 }
 
-// Parse validates a .pbin and splits it into header, signature, and ZIP payload.
+// File is a parsed .pbin container.
+type File struct {
+	// Version is the container version from the header; it is also the last
+	// byte of the trailer and is covered by the signature.
+	Version byte
+
+	// Signature is the RSA-4096 PKCS#1 v1.5 SHA-1 signature over
+	// (Zip || Trailer). For containers packed without Valve's private key it
+	// is a zero placeholder.
+	Signature []byte
+
+	// Zip is the raw ZIP archive payload, verbatim and truncated at its
+	// end-of-central-directory record (no trailer bytes).
+	Zip []byte
+
+	// Trailer is everything between the end of the ZIP and EOF. Version 1
+	// files have 1 byte (the version), version 2 files have 5 bytes (4
+	// unknown bytes then the version). Preserved verbatim by Parse.
+	Trailer []byte
+}
+
+// SignedPayload returns the exact byte range covered by the signature:
+// everything after the 516-byte prefix, i.e. the ZIP plus the trailer. This
+// matches panzip, which signs the buffer after appending the version byte,
+// and the final client's verifier, which hashes from the end of the
+// signature field to EOF.
+func (f *File) SignedPayload() []byte {
+	out := make([]byte, 0, len(f.Zip)+len(f.Trailer))
+	out = append(out, f.Zip...)
+	out = append(out, f.Trailer...)
+	return out
+}
+
+// Parse validates a .pbin and splits it into header, signature, ZIP payload,
+// and trailer. The container version comes from the header; the ZIP end is
+// located via the end-of-central-directory record, so versions with unknown
+// envelope sizes still unpack.
 func Parse(data []byte) (*File, error) {
 	if len(data) < MinSize {
 		return nil, fmt.Errorf("not a pbin container: only %d bytes (minimum is %d)", len(data), MinSize)
@@ -84,22 +159,61 @@ func Parse(data []byte) (*File, error) {
 	}
 
 	version := data[3]
-	trailer := data[len(data)-1]
-	if trailer != version {
-		return nil, fmt.Errorf("corrupt pbin: trailing version byte 0x%02x does not match header version 0x%02x", trailer, version)
+	if last := data[len(data)-1]; last != version {
+		return nil, fmt.Errorf("corrupt pbin: trailing byte 0x%02x does not match header version 0x%02x", last, version)
 	}
 
 	signature := make([]byte, SignatureSize)
 	copy(signature, data[HeaderSize:OverheadSize])
 
-	// The payload must be a plausible ZIP: it has to start with the local file
-	// header signature. Anything else means the file is not really a pbin.
-	zipData := data[OverheadSize : len(data)-TrailerSize]
-	if len(zipData) < 4 || !bytes.Equal(zipData[:4], []byte("PK\x03\x04")) {
-		return nil, errors.New("corrupt pbin: payload after the 516-byte prefix is not a ZIP archive (missing \"PK\\x03\\x04\" local file header)")
+	payload := data[OverheadSize:]
+	if len(payload) < 4 || (!bytes.Equal(payload[:4], localHeaderSig) && !bytes.Equal(payload[:4], emptyZipSig)) {
+		return nil, errors.New("corrupt pbin: payload after the 516-byte prefix is not a ZIP archive (missing \"PK\" signature)")
 	}
 
-	return &File{Version: version, Signature: signature, Zip: zipData}, nil
+	end, err := findZipEnd(payload, ExpectedTrailerSize(version))
+	if err != nil {
+		return nil, fmt.Errorf("corrupt pbin: %w", err)
+	}
+
+	return &File{
+		Version:   version,
+		Signature: signature,
+		Zip:       payload[:end],
+		Trailer:   payload[end:],
+	}, nil
+}
+
+// findZipEnd returns the offset just past the ZIP inside payload. expected is
+// the trailer size implied by the container version, or -1 when unknown. For
+// known versions it prefers an exact trailer size and falls back to the
+// end-of-central-directory record nearest the end, so a mislabeled or odd
+// file still unpacks instead of failing outright.
+func findZipEnd(payload []byte, expected int) (int, error) {
+	fallback := -1
+	for i := len(payload) - 22; i >= 0; i-- {
+		if !bytes.Equal(payload[i:i+4], eocdSig) {
+			continue
+		}
+		commentLen := int(binary.LittleEndian.Uint16(payload[i+20 : i+22]))
+		end := i + 22 + commentLen
+		if end > len(payload) {
+			continue
+		}
+		if expected < 0 {
+			return end, nil
+		}
+		if len(payload)-end == expected {
+			return end, nil
+		}
+		if fallback < 0 {
+			fallback = end
+		}
+	}
+	if fallback >= 0 {
+		return fallback, nil
+	}
+	return 0, errors.New("payload is not a ZIP archive (no end-of-central-directory record found)")
 }
 
 // MarshalBinary serializes the container back into .pbin bytes.
@@ -110,15 +224,24 @@ func (f *File) MarshalBinary() ([]byte, error) {
 	if len(f.Signature) != SignatureSize {
 		return nil, fmt.Errorf("pbin: signature must be exactly %d bytes, got %d", SignatureSize, len(f.Signature))
 	}
-	if len(f.Zip) < 4 || !bytes.Equal(f.Zip[:4], []byte("PK\x03\x04")) {
-		return nil, errors.New("pbin: payload is not a ZIP archive (missing \"PK\\x03\\x04\" local file header)")
+	if len(f.Zip) < 4 || (!bytes.Equal(f.Zip[:4], localHeaderSig) && !bytes.Equal(f.Zip[:4], emptyZipSig)) {
+		return nil, errors.New("pbin: payload is not a ZIP archive (missing \"PK\" signature)")
+	}
+	if len(f.Trailer) == 0 {
+		return nil, errors.New("pbin: trailer must not be empty")
+	}
+	if expected := ExpectedTrailerSize(f.Version); expected >= 0 && len(f.Trailer) != expected {
+		return nil, fmt.Errorf("pbin: version %d requires a %d-byte trailer, got %d", f.Version, expected, len(f.Trailer))
+	}
+	if f.Trailer[len(f.Trailer)-1] != f.Version {
+		return nil, fmt.Errorf("pbin: trailer must end with the version byte 0x%02x, got 0x%02x", f.Version, f.Trailer[len(f.Trailer)-1])
 	}
 
-	out := make([]byte, 0, OverheadSize+len(f.Zip)+TrailerSize)
+	out := make([]byte, 0, OverheadSize+len(f.Zip)+len(f.Trailer))
 	out = append(out, magic[0], magic[1], magic[2], f.Version)
 	out = append(out, f.Signature...)
 	out = append(out, f.Zip...)
-	out = append(out, f.Version)
+	out = append(out, f.Trailer...)
 	return out, nil
 }
 
@@ -133,35 +256,68 @@ func (f *File) IsSigned() bool {
 	return false
 }
 
-// Pack builds a container around a ZIP payload with a zero placeholder
-// signature (Valve's game will reject it; see PackSigned for a real signature).
-func Pack(zipData []byte, version byte) *File {
-	signature := make([]byte, SignatureSize)
-	return &File{Version: version, Signature: signature, Zip: zipData}
+// defaultTrailer returns the trailer bytes written by Pack for a version.
+func defaultTrailer(version byte) []byte {
+	switch version {
+	case Version1:
+		return []byte{Version1}
+	case Version2:
+		// Four unknown bytes (never read back by the client, so zeroed)
+		// followed by the version byte, matching the final parser's
+		// total-0x209 payload length.
+		return []byte{0, 0, 0, 0, Version2}
+	default:
+		return []byte{version}
+	}
 }
 
-// PackSigned builds a container around a ZIP payload and signs it with the
-// given private key, mirroring panzip's launcher_keypair_signdata: SHA-1 of
-// (zip || version), RSA PKCS#1 v1.5. The key must be a 4096-bit RSA key so the
-// signature fits the fixed 512-byte field expected by the engine verifier.
-func PackSigned(zipData []byte, version byte, key *rsa.PrivateKey) (*File, error) {
+// Pack builds a container around a ZIP payload with a zero placeholder
+// signature (Valve's game will reject it; see PackSigned for a real
+// signature). Packing targets version 2 (the final 2023 client) unless
+// stated otherwise.
+func Pack(zipData []byte, version byte) (*File, error) {
 	if version == 0 {
 		return nil, errors.New("pbin: version must not be 0")
 	}
-	signature, err := Sign(key, zipData, version)
-	if err != nil {
-		return nil, err
+	if len(zipData) < 4 || (!bytes.Equal(zipData[:4], localHeaderSig) && !bytes.Equal(zipData[:4], emptyZipSig)) {
+		return nil, errors.New("pbin: input is not a ZIP archive (missing \"PK\" signature)")
 	}
-	return &File{Version: version, Signature: signature, Zip: zipData}, nil
+	if version == Version2 && OverheadSize+len(zipData)+TrailerSizeV2 < MinSizeV2 {
+		return nil, fmt.Errorf("pbin: the 2023 client rejects files smaller than %d bytes (this container would be %d)",
+			MinSizeV2, OverheadSize+len(zipData)+TrailerSizeV2)
+	}
+	return &File{
+		Version:   version,
+		Signature: make([]byte, SignatureSize),
+		Zip:       zipData,
+		Trailer:   defaultTrailer(version),
+	}, nil
 }
 
-// Sign computes the 512-byte pbin signature over (zip || version).
-func Sign(key *rsa.PrivateKey, zipData []byte, version byte) ([]byte, error) {
-	digest, err := digest(zipData, version)
+// PackSigned is Pack plus a real signature over (Zip || Trailer) made with
+// the given key, mirroring panzip's launcher_keypair_signdata: SHA-1, RSA
+// PKCS#1 v1.5. The key must be 4096-bit so the signature fits the fixed
+// 512-byte field. The final client verifies against Valve's embedded
+// (rotated) public key, so only a patched verifier accepts a self-signed
+// container.
+func PackSigned(zipData []byte, version byte, key *rsa.PrivateKey) (*File, error) {
+	f, err := Pack(zipData, version)
 	if err != nil {
 		return nil, err
 	}
-	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA1, digest)
+	signature, err := Sign(key, f.SignedPayload())
+	if err != nil {
+		return nil, err
+	}
+	f.Signature = signature
+	return f, nil
+}
+
+// Sign computes the 512-byte pbin signature over a payload consisting of the
+// ZIP bytes followed by the trailer.
+func Sign(key *rsa.PrivateKey, payload []byte) ([]byte, error) {
+	sum := sha1.Sum(payload)
+	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA1, sum[:])
 	if err != nil {
 		return nil, fmt.Errorf("signing failed: %w", err)
 	}
@@ -171,28 +327,14 @@ func Sign(key *rsa.PrivateKey, zipData []byte, version byte) ([]byte, error) {
 	return signature, nil
 }
 
-// Verify checks the container signature against a public key.
+// Verify checks the container signature (over ZIP || trailer) against a
+// public key.
 func (f *File) Verify(key *rsa.PublicKey) error {
-	digest, err := digest(f.Zip, f.Version)
-	if err != nil {
-		return err
-	}
-	if err := rsa.VerifyPKCS1v15(key, crypto.SHA1, digest, f.Signature); err != nil {
+	sum := sha1.Sum(f.SignedPayload())
+	if err := rsa.VerifyPKCS1v15(key, crypto.SHA1, sum[:], f.Signature); err != nil {
 		return fmt.Errorf("signature verification failed: %w", err)
 	}
 	return nil
-}
-
-// digest mirrors the signed payload: SHA-1 over (zip bytes || version byte).
-func digest(zipData []byte, version byte) ([]byte, error) {
-	h := sha1.New()
-	if _, err := h.Write(zipData); err != nil {
-		return nil, err
-	}
-	if _, err := h.Write([]byte{version}); err != nil {
-		return nil, err
-	}
-	return h.Sum(nil), nil
 }
 
 // LoadPrivateKey reads an RSA private key from PEM data, accepting both
