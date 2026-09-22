@@ -143,6 +143,52 @@ rules below (exit 0 = accepted). In detail:
   `-build-number`) and legal resource names/paths inside the ZIP: the
   loader rejects illegal names and empty manifests.
 
+### Where is the private key?
+
+Nowhere reachable — stated plainly, because we looked rather than assumed.
+The signing half of Valve's panorama-pack key was never shipped, never
+leaked, and cannot be derived:
+
+- **The leaked source names the file but does not contain it.**
+  `utils/panzip/panzip.cpp` includes
+  `devtools/bin/certificates/panoramapack.private.h` directly into the
+  packer and signs with it (`launcher_keypair_signdata`). The leaked
+  `csgo_partner` tree only ships the matching `panoramapack.public.h`
+  (the 2019 key, modulus starting `C3 77 62 5E`); a filesystem-wide
+  search for `panoramapack*` finds no `.private.h` anywhere.
+- **No shipped binary contains a PEM private key.** A case-insensitive
+  byte scan for `PRIVATE KEY` — which covers every PEM private-key label,
+  including `RSA PRIVATE KEY` and `PRIVATE KEY` — plus `BEGIN RSA`, over
+  the installed game's DLLs and EXEs, hits only crypto-library label
+  tables: OpenSSL's PEM names in `video.dll`, libssh's
+  `-----BEGIN OPENSSH PRIVATE KEY-----` template in
+  `steamnetworkingsockets.dll`, Go `crypto/x509` labels in the non-Valve
+  `csgo-inventory-editor.exe`, and lowercase prose in `engine.dll`.
+  `panorama.dll`, `panoramauiclient.dll`, `client.dll`, and `csgo.exe`
+  have zero hits, and `engine.dll` contains no `-----BEGIN` PEM header
+  at all.
+- **What the client embeds is only the public half.** The blob
+  reconstructed from `panorama.dll` (`tools/certcheck`) is a 548-byte
+  SubjectPublicKeyInfo — modulus plus exponent 17. A 4096-bit private key
+  is a ~2.4 KB structure of nine INTEGERs (`d`, `p`, `q`, `dP`, `dQ`,
+  `qInv`, …); no structure of that shape exists in the binary.
+- **It could not be derived either.** The client only verifies, so it
+  needs only the public half; recovering the private exponent from a
+  4096-bit modulus means factoring that modulus, which is not feasible.
+  And shipping the private key would let anyone sign an arbitrary
+  `code.pbin`, defeating the check — which is why it exists only in
+  Valve's build tree.
+- **Even the 2019 private key would not help the 2023 client.** The key
+  rotated (`C3 77 62 5E …` → `B0 9F D8 72 …`, an entirely different
+  modulus), so a recovered old key could only sign version-1 containers
+  for pre-2020 clients.
+
+Consequences, honestly: a modified ZIP can **never** satisfy the stock
+2023 verifier — the routes above are patching the verifier or swapping
+the embedded certificate, after which `-sign` produces signatures valid
+only under your own key or patched client. The only stock-safe repack
+remains `pack -template` with byte-identical, unmodified content.
+
 ## Verified against the official sample
 
 All of the above was cross-checked against Valve's unmodified final
