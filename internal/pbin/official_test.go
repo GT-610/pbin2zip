@@ -2,8 +2,6 @@ package pbin
 
 import (
 	"bytes"
-	"crypto/rsa"
-	"crypto/x509"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,17 +24,9 @@ func TestOfficialSample(t *testing.T) {
 		t.Skipf("official code.pbin not available: %v", err)
 	}
 
-	der, err := os.ReadFile(filepath.Join("testdata", "panoramapack_2023.der"))
+	rsaPub, err := OfficialPublicKey()
 	if err != nil {
-		t.Fatalf("reading embedded public key: %v", err)
-	}
-	pub, err := x509.ParsePKIXPublicKey(der)
-	if err != nil {
-		t.Fatalf("parsing embedded public key: %v", err)
-	}
-	rsaPub, ok := pub.(*rsa.PublicKey)
-	if !ok {
-		t.Fatal("embedded key is not RSA")
+		t.Fatalf("loading embedded public key: %v", err)
 	}
 
 	f, err := Parse(data)
@@ -72,7 +62,7 @@ func TestOfficialSample(t *testing.T) {
 	}
 
 	// The official signature must verify against the final client's key.
-	// This is what pins SignedPayload to [516, EOF) = ZIP || trailer.
+	// This is what pins the signed range to [516, EOF) = ZIP || trailer.
 	if !f.IsSigned() {
 		t.Error("official container reports unsigned")
 	}
