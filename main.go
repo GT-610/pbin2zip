@@ -5,6 +5,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/rsa"
 	"crypto/sha256"
 	"errors"
 	"flag"
@@ -33,8 +34,9 @@ Commands:
           (version 2) by default; zeroed signature unless -sign
   info    show container version, signature state, trailer, and ZIP contents
   verify  check a container the way the stock final 2023 client would:
-          version-2 envelope, gate value 13881, official RSA signature;
-          exit 0 when the client would load it, exit 1 when it would not
+          at least 581 bytes, version-2 envelope, gate value 13881,
+          official RSA signature; exit 0 when the client would load it,
+          exit 1 when it would not
 
 Options:
   -o string         output path (default: input with the other extension; "-" for stdout)
@@ -164,13 +166,16 @@ func cmdPack(args []string) error {
 	out := fs.String("o", "", "output pbin path (`-` for stdout)")
 	signPath := fs.String("sign", "", "RSA private key PEM used to sign the container")
 	template := fs.String("template", "", "reuse signature and trailer from this pbin (verified against the official key)")
-	buildNumber := fs.Uint("build-number", pbin.DefaultBuildNumber, "v2 trailer gate value the client expects")
+	buildNumber := fs.Uint64("build-number", pbin.DefaultBuildNumber, "v2 trailer gate value the client expects")
 	version := fs.Int("version", int(pbin.DefaultVersion), "container version (2 = final 2023 client, 1 = pre-2020)")
 	if err := fs.Parse(args); err != nil {
 		return usageErrorf("%v\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem | -template ref.pbin] [-build-number N] [-version N] <file.zip | ->", err)
 	}
 	if fs.NArg() != 1 {
 		return usageErrorf("pack expects exactly one input\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem | -template ref.pbin] [-build-number N] [-version N] <file.zip | ->")
+	}
+	if *buildNumber > uint64(^uint32(0)) {
+		return usageErrorf("-build-number must be between 0 and 4294967295, got %d", *buildNumber)
 	}
 	if *version <= 0 || *version > 255 {
 		return usageErrorf("-version must be between 1 and 255, got %d", *version)
@@ -201,27 +206,33 @@ func cmdPack(args []string) error {
 		return fmt.Errorf("%s is not a valid ZIP archive: %w", displayName(in), err)
 	}
 
-	var f *pbin.File
-	templateVerified := false
-	switch {
-	case *signPath != "":
+	// Load the signing key up front; the envelope itself is built below and
+	// signed only after the gate rewrite, because the gate bytes are inside
+	// the signed range.
+	var signKey *rsa.PrivateKey
+	if *signPath != "" {
 		keyPEM, err := os.ReadFile(*signPath)
 		if err != nil {
 			return fmt.Errorf("reading key %s: %w", *signPath, err)
 		}
-		key, err := pbin.LoadPrivateKey(keyPEM)
+		signKey, err = pbin.LoadPrivateKey(keyPEM)
 		if err != nil {
 			return fmt.Errorf("loading key %s: %w", *signPath, err)
 		}
-		f, err = pbin.PackSigned(data, byte(*version), key)
-		if err != nil {
-			return err
-		}
+	}
+
+	// Build the common envelope once; the branches below only decide what
+	// goes into the signature field.
+	f, err := pbin.Pack(data, byte(*version))
+	if err != nil {
+		return err
+	}
+	templateVerified := false
+	switch {
+	case *signPath != "":
+		// The signature field keeps Pack's zero placeholder until the gate
+		// rewrite below has settled the final bytes to sign.
 	case *template != "":
-		f, err = pbin.Pack(data, byte(*version))
-		if err != nil {
-			return err
-		}
 		refData, err := os.ReadFile(*template)
 		if err != nil {
 			return fmt.Errorf("reading template %s: %w", *template, err)
@@ -248,10 +259,6 @@ func cmdPack(args []string) error {
 			fmt.Fprintf(os.Stderr, "pbin2zip: warning: template envelope copied but not verified (no embedded key for version %d)\n", f.Version)
 		}
 	default:
-		f, err = pbin.Pack(data, byte(*version))
-		if err != nil {
-			return err
-		}
 		fmt.Fprintln(os.Stderr, "pbin2zip: warning: packing with a zeroed signature; the stock game will reject this container (use -template for unmodified round trips, or patch the verifier for research)")
 	}
 	if bnExplicit {
@@ -259,16 +266,30 @@ func cmdPack(args []string) error {
 			return err
 		}
 	}
-	if templateVerified {
-		// The gate value lives in the trailer, which is part of the signed
-		// range, so -build-number can invalidate a copied template signature.
-		// Verify once more after any gate rewrite and say which way the
-		// stock client would now treat the output.
-		key, err := pbin.OfficialPublicKey()
-		if err != nil {
+	// Sign only now: the trailer's gate value is part of [516, EOF), so
+	// signing before the -build-number rewrite would leave the signature
+	// covering the pre-rewrite trailer and the client would reject the
+	// output.
+	if *signPath != "" {
+		if err := f.Sign(signKey); err != nil {
 			return err
 		}
-		if err := f.Verify(key); err != nil {
+	}
+	if templateVerified {
+		// The gate value lives in the trailer, which is part of the signed
+		// range, so -build-number can invalidate the copied signature. When
+		// the gate was not rewritten the verification done above still
+		// stands — re-running it would only hash and check the whole
+		// multi-megabyte payload a second time.
+		broken := false
+		if bnExplicit {
+			key, err := pbin.OfficialPublicKey()
+			if err != nil {
+				return err
+			}
+			broken = f.Verify(key) != nil
+		}
+		if broken {
 			fmt.Fprintf(os.Stderr, "pbin2zip: warning: the gate value set by -build-number breaks the copied signature (the trailer is signed too) — the stock client will reject this output\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "pbin2zip: template envelope verified against the official key; output is byte-identical to %s\n", displayName(*template))
@@ -360,8 +381,9 @@ func cmdInfo(args []string) error {
 }
 
 // cmdVerify checks a container against exactly what the stock final (2023)
-// client enforces, in the client's own order: a version-2 envelope, the gate
-// value INETSUPPORT_003 reports (13881 for the frozen build), and a valid
+// client enforces, in the client's own order: a file of at least 581 bytes
+// (CMP ECX,0x245 in FUN_10011f80), a version-2 envelope, the gate value
+// INETSUPPORT_003 reports (13881 for the frozen build), and a valid
 // signature under Valve's embedded public key. Exit status 0 means the
 // client would accept the file, 1 means it would reject it.
 func cmdVerify(args []string) error {
@@ -377,6 +399,13 @@ func cmdVerify(args []string) error {
 	data, err := readInput(in)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", displayName(in), err)
+	}
+	// The client's first gate is CMP ECX,0x245: reject below the 581-byte
+	// floor before parsing, so even structurally invalid tiny files get the
+	// diagnostic the stock client would act on.
+	if len(data) < pbin.MinSizeV2 {
+		return fmt.Errorf("%s: file is %d bytes, the final client requires at least %d",
+			displayName(in), len(data), pbin.MinSizeV2)
 	}
 	f, err := pbin.Parse(data)
 	if err != nil {

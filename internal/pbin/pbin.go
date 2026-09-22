@@ -98,15 +98,22 @@ const (
 // magic is the 'PAN' prefix of the header.
 var magic = [3]byte{'P', 'A', 'N'}
 
-// Accepted starts of a ZIP payload.
-var (
-	localHeaderSig = []byte{'P', 'K', 0x03, 0x04}
-	emptyZipSig    = []byte{'P', 'K', 0x05, 0x06}
-)
+// localHeaderSig is the normal start of a ZIP archive.
+var localHeaderSig = []byte{'P', 'K', 0x03, 0x04}
 
-// eocdSig is the ZIP end-of-central-directory signature, used to locate the
-// exact end of the ZIP payload regardless of container version.
+// eocdSig is the ZIP end-of-central-directory signature. It is also the first
+// record of an empty ZIP archive, so it serves as both a payload-start
+// signature and the marker used to locate the ZIP end.
 var eocdSig = []byte{'P', 'K', 0x05, 0x06}
+
+// isZipStart reports whether data begins with a signature accepted for a ZIP
+// payload: a local file header, or an empty archive's EOCD record.
+func isZipStart(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	return bytes.Equal(data[:4], localHeaderSig) || bytes.Equal(data[:4], eocdSig)
+}
 
 // ErrNotPbin is returned by Parse when the data does not start with 'PAN'.
 var ErrNotPbin = errors.New("not a pbin container: missing \"PAN\" magic")
@@ -178,7 +185,7 @@ func Parse(data []byte) (*File, error) {
 	copy(signature, data[HeaderSize:OverheadSize])
 
 	payload := data[OverheadSize:]
-	if len(payload) < 4 || (!bytes.Equal(payload[:4], localHeaderSig) && !bytes.Equal(payload[:4], emptyZipSig)) {
+	if !isZipStart(payload) {
 		return nil, errors.New("corrupt pbin: payload after the 516-byte prefix is not a ZIP archive (missing \"PK\" signature)")
 	}
 
@@ -235,7 +242,7 @@ func (f *File) MarshalBinary() ([]byte, error) {
 	if len(f.Signature) != SignatureSize {
 		return nil, fmt.Errorf("pbin: signature must be exactly %d bytes, got %d", SignatureSize, len(f.Signature))
 	}
-	if len(f.Zip) < 4 || (!bytes.Equal(f.Zip[:4], localHeaderSig) && !bytes.Equal(f.Zip[:4], emptyZipSig)) {
+	if !isZipStart(f.Zip) {
 		return nil, errors.New("pbin: payload is not a ZIP archive (missing \"PK\" signature)")
 	}
 	if len(f.Trailer) == 0 {
@@ -308,14 +315,14 @@ func (f *File) SetBuildNumber(build uint32) error {
 }
 
 // Pack builds a container around a ZIP payload with a zero placeholder
-// signature (Valve's game will reject it; see PackSigned for a real
+// signature (Valve's game will reject it; see File.Sign for a real
 // signature). Packing targets version 2 (the final 2023 client) unless
 // stated otherwise.
 func Pack(zipData []byte, version byte) (*File, error) {
 	if version == 0 {
 		return nil, errors.New("pbin: version must not be 0")
 	}
-	if len(zipData) < 4 || (!bytes.Equal(zipData[:4], localHeaderSig) && !bytes.Equal(zipData[:4], emptyZipSig)) {
+	if !isZipStart(zipData) {
 		return nil, errors.New("pbin: input is not a ZIP archive (missing \"PK\" signature)")
 	}
 	if version == Version2 && OverheadSize+len(zipData)+TrailerSizeV2 < MinSizeV2 {
@@ -330,37 +337,29 @@ func Pack(zipData []byte, version byte) (*File, error) {
 	}, nil
 }
 
-// PackSigned is Pack plus a real signature over (Zip || Trailer) made with
-// the given key, mirroring panzip's launcher_keypair_signdata: SHA-1, RSA
-// PKCS#1 v1.5. The key must be 4096-bit so the signature fits the fixed
+// Sign computes the 512-byte pbin signature over the container's current
+// bytes (Zip || Trailer) — mirroring panzip's launcher_keypair_signdata:
+// SHA-1, RSA PKCS#1 v1.5 — and stores it in f.Signature. Call it only after
+// every byte that will be written is final: the trailer's gate value is part
+// of the signed range, so a later SetBuildNumber would invalidate the
+// signature. The key must be RSA-4096 so the signature fits the fixed
 // 512-byte field. The final client verifies against Valve's embedded
 // (rotated) public key, so only a patched verifier accepts a self-signed
 // container.
-func PackSigned(zipData []byte, version byte, key *rsa.PrivateKey) (*File, error) {
-	f, err := Pack(zipData, version)
-	if err != nil {
-		return nil, err
+func (f *File) Sign(key *rsa.PrivateKey) error {
+	if key == nil {
+		return errors.New("pbin: signing requires a private key")
 	}
-	signature, err := Sign(key, f.SignedPayload())
-	if err != nil {
-		return nil, err
-	}
-	f.Signature = signature
-	return f, nil
-}
-
-// Sign computes the 512-byte pbin signature over a payload consisting of the
-// ZIP bytes followed by the trailer.
-func Sign(key *rsa.PrivateKey, payload []byte) ([]byte, error) {
-	sum := sha1.Sum(payload)
+	sum := sha1.Sum(f.SignedPayload())
 	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA1, sum[:])
 	if err != nil {
-		return nil, fmt.Errorf("signing failed: %w", err)
+		return fmt.Errorf("signing failed: %w", err)
 	}
 	if len(signature) != SignatureSize {
-		return nil, fmt.Errorf("pbin requires a %d-bit RSA key so the signature is %d bytes (got %d bytes)", SignatureSize*8, SignatureSize, len(signature))
+		return fmt.Errorf("pbin requires a %d-bit RSA key so the signature is %d bytes (got %d bytes)", SignatureSize*8, SignatureSize, len(signature))
 	}
-	return signature, nil
+	f.Signature = signature
+	return nil
 }
 
 // Verify checks the container signature (over ZIP || trailer) against a

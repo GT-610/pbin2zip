@@ -3,8 +3,14 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/GT-610/pbin2zip/internal/pbin"
@@ -36,6 +42,29 @@ func makeTestZip(t *testing.T, dir string) string {
 		t.Fatalf("writing zip file: %v", err)
 	}
 	return path
+}
+
+// captureStderr runs fn with os.Stderr redirected into a pipe and returns
+// everything fn wrote to it, so tests can assert on diagnostic messages.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating stderr pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing stderr pipe: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		t.Fatalf("reading captured stderr: %v", err)
+	}
+	return string(out)
 }
 
 func TestReplaceExt(t *testing.T) {
@@ -237,13 +266,48 @@ func TestRunPackBuildNumber(t *testing.T) {
 	if code := run([]string{"pack", "-version", "1", "-build-number", "4242", zipPath}); code != 2 {
 		t.Errorf("build number with v1: exit code = %d, want 2", code)
 	}
+
+	// Values that do not fit the trailer's little-endian uint32 must be
+	// rejected instead of silently truncated on the uint32 cast.
+	if code := run([]string{"pack", "-build-number", "4294967296", zipPath}); code != 2 {
+		t.Errorf("overflowing build number: exit code = %d, want 2", code)
+	}
+
+	// The largest legal value round-trips into the trailer.
+	maxPbn := filepath.Join(dir, "max.pbin")
+	if code := run([]string{"pack", "-build-number", "4294967295", "-o", maxPbn, zipPath}); code != 0 {
+		t.Fatalf("pack -build-number 4294967295 exit code = %d, want 0", code)
+	}
+	blob, err = os.ReadFile(maxPbn)
+	if err != nil {
+		t.Fatalf("reading packed container: %v", err)
+	}
+	if want := []byte{0xff, 0xff, 0xff, 0xff, pbin.Version2}; !bytes.Equal(blob[len(blob)-5:], want) {
+		t.Errorf("max gate trailer = %x, want %x", blob[len(blob)-5:], want)
+	}
+}
+
+// officialSample returns the path to Valve's unmodified final code.pbin:
+// PBIN2ZIP_SAMPLE if set, else .vscode/code.pbin at the repository root
+// (this file is in the root package). The sample is game content and is not
+// committed, so tests skip when it is absent.
+func officialSample(t *testing.T) string {
+	t.Helper()
+	sample := os.Getenv("PBIN2ZIP_SAMPLE")
+	if sample == "" {
+		sample = filepath.Join(".vscode", "code.pbin")
+	}
+	if _, err := os.Stat(sample); err != nil {
+		t.Skipf("official code.pbin not available: %v", err)
+	}
+	return sample
 }
 
 func TestRunPackTemplate(t *testing.T) {
-	sample := filepath.Join("..", ".vscode", "code.pbin")
+	sample := officialSample(t)
 	official, err := os.ReadFile(sample)
 	if err != nil {
-		t.Skipf("official code.pbin not available: %v", err)
+		t.Fatalf("reading official sample: %v", err)
 	}
 
 	dir := t.TempDir()
@@ -303,6 +367,47 @@ func TestRunPackTemplate(t *testing.T) {
 	}
 }
 
+// TestRunPackSignIncludesBuildNumber pins the signing order: -sign used to
+// run before the -build-number gate rewrite, so the signature covered a
+// trailer that no longer existed on disk. The signature must verify against
+// the final written bytes.
+func TestRunPackSignIncludesBuildNumber(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := makeTestZip(t, dir)
+
+	key, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		t.Fatalf("generating RSA key: %v", err)
+	}
+	keyPath := filepath.Join(dir, "key.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatalf("writing key file: %v", err)
+	}
+
+	pbn := filepath.Join(dir, "signed.pbin")
+	if code := run([]string{"pack", "-sign", keyPath, "-build-number", "4242", "-o", pbn, zipPath}); code != 0 {
+		t.Fatalf("pack -sign -build-number exit code = %d, want 0", code)
+	}
+	data, err := os.ReadFile(pbn)
+	if err != nil {
+		t.Fatalf("reading packed container: %v", err)
+	}
+	f, err := pbin.Parse(data)
+	if err != nil {
+		t.Fatalf("parsing packed container: %v", err)
+	}
+	if build, ok := f.BuildNumber(); !ok || build != 4242 {
+		t.Fatalf("gate value = %d (ok=%v), want 4242", build, ok)
+	}
+	if err := f.Verify(&key.PublicKey); err != nil {
+		t.Fatalf("signature does not cover the final trailer: %v", err)
+	}
+}
+
 func TestRunVerify(t *testing.T) {
 	dir := t.TempDir()
 	zipPath := makeTestZip(t, dir)
@@ -350,11 +455,36 @@ func TestRunVerify(t *testing.T) {
 		t.Errorf("verify v1 container: exit code = %d, want 1", code)
 	}
 
-	// The official sample must pass every check.
-	sample := filepath.Join("..", ".vscode", "code.pbin")
-	if _, err := os.Stat(sample); err != nil {
-		t.Skipf("official code.pbin not available: %v", err)
+	// A v2 container below the client's 581-byte floor must be reported as
+	// undersized, not merely fail on the zeroed signature. An empty ZIP
+	// (22-byte EOCD) plus the v2 envelope and trailer is 543 bytes: well
+	// above the parser's 517-byte structural minimum, below the client's.
+	var eocd bytes.Buffer
+	if err := zip.NewWriter(&eocd).Close(); err != nil {
+		t.Fatalf("building empty zip: %v", err)
 	}
+	small := make([]byte, 0, pbin.OverheadSize+eocd.Len()+pbin.TrailerSizeV2)
+	small = append(small, 'P', 'A', 'N', pbin.Version2)
+	small = append(small, make([]byte, pbin.SignatureSize)...)
+	small = append(small, eocd.Bytes()...)
+	small = append(small, 0x39, 0x36, 0x00, 0x00, pbin.Version2) // official gate, correct version byte
+	smallPath := filepath.Join(dir, "small.pbin")
+	if err := os.WriteFile(smallPath, small, 0o644); err != nil {
+		t.Fatalf("writing undersized container: %v", err)
+	}
+	code := -1
+	errText := captureStderr(t, func() {
+		code = run([]string{"verify", smallPath})
+	})
+	if code != 1 {
+		t.Errorf("verify undersized v2: exit code = %d, want 1", code)
+	}
+	if !strings.Contains(errText, "581") {
+		t.Errorf("verify undersized v2 did not report the 581-byte minimum, stderr:\n%s", errText)
+	}
+
+	// The official sample must pass every check.
+	sample := officialSample(t)
 	if code := run([]string{"verify", sample}); code != 0 {
 		t.Errorf("verify official sample: exit code = %d, want 0", code)
 	}

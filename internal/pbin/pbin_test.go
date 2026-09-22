@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -38,6 +39,26 @@ func sampleZip(t *testing.T) []byte {
 		"panorama/styles.css": "body { color: red; }",
 		"panorama/script.js":  "const x = 1;",
 	})
+}
+
+var (
+	testKeyOnce sync.Once
+	testKey     *rsa.PrivateKey
+	testKeyErr  error
+)
+
+// sharedTestKey generates one 4096-bit RSA key per test binary. Key
+// generation dominates the runtime of the signing and key-loading tests,
+// and neither test needs a fresh key — only a stable one.
+func sharedTestKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	testKeyOnce.Do(func() {
+		testKey, testKeyErr = rsa.GenerateKey(rand.Reader, 4096)
+	})
+	if testKeyErr != nil {
+		t.Fatalf("generating RSA key: %v", testKeyErr)
+	}
+	return testKey
 }
 
 func TestRoundTrip(t *testing.T) {
@@ -316,17 +337,17 @@ func TestPackEnforcesMinSizeV2(t *testing.T) {
 }
 
 func TestSignAndVerify(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		t.Fatalf("generating RSA key: %v", err)
-	}
+	key := sharedTestKey(t)
 	zipData := sampleZip(t)
 
 	for _, version := range []byte{Version1, Version2} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
-			f, err := PackSigned(zipData, version, key)
+			f, err := Pack(zipData, version)
 			if err != nil {
-				t.Fatalf("PackSigned: %v", err)
+				t.Fatalf("Pack: %v", err)
+			}
+			if err := f.Sign(key); err != nil {
+				t.Fatalf("Sign: %v", err)
 			}
 			if !f.IsSigned() {
 				t.Fatal("signed container reports unsigned")
@@ -345,9 +366,12 @@ func TestSignAndVerify(t *testing.T) {
 	}
 
 	// The trailer is inside the signed range: flipping a byte breaks it.
-	f, err := PackSigned(zipData, Version2, key)
+	f, err := Pack(zipData, Version2)
 	if err != nil {
-		t.Fatalf("PackSigned: %v", err)
+		t.Fatalf("Pack: %v", err)
+	}
+	if err := f.Sign(key); err != nil {
+		t.Fatalf("Sign: %v", err)
 	}
 	f.Trailer = append([]byte(nil), f.Trailer...)
 	f.Trailer[0] = 0xFF
@@ -360,16 +384,23 @@ func TestSignAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generating short RSA key: %v", err)
 	}
-	if _, err := PackSigned(zipData, Version2, shortKey); err == nil {
-		t.Fatal("PackSigned with 2048-bit key succeeded, want error")
+	if err := f.Sign(shortKey); err == nil {
+		t.Fatal("Sign with a 2048-bit key succeeded, want error")
+	}
+
+	// A missing key is a usage error, not a panic, and leaves the previous
+	// signature untouched.
+	saved := append([]byte(nil), f.Signature...)
+	if err := f.Sign(nil); err == nil {
+		t.Fatal("Sign(nil) succeeded, want error")
+	}
+	if !bytes.Equal(f.Signature, saved) {
+		t.Error("failed Sign(nil) modified the signature")
 	}
 }
 
 func TestLoadPrivateKey(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		t.Fatalf("generating RSA key: %v", err)
-	}
+	key := sharedTestKey(t)
 
 	pkcs1 := pem.EncodeToMemory(&pem.Block{
 		Type:  "RSA PRIVATE KEY",
