@@ -283,11 +283,27 @@ func TestRunPackBuildNumber(t *testing.T) {
 	}
 }
 
+// officialSample returns the path to Valve's unmodified final code.pbin:
+// PBIN2ZIP_SAMPLE if set, else .vscode/code.pbin at the repository root
+// (this file is in the root package). The sample is game content and is not
+// committed, so tests skip when it is absent.
+func officialSample(t *testing.T) string {
+	t.Helper()
+	sample := os.Getenv("PBIN2ZIP_SAMPLE")
+	if sample == "" {
+		sample = filepath.Join(".vscode", "code.pbin")
+	}
+	if _, err := os.Stat(sample); err != nil {
+		t.Skipf("official code.pbin not available: %v", err)
+	}
+	return sample
+}
+
 func TestRunPackTemplate(t *testing.T) {
-	sample := filepath.Join("..", ".vscode", "code.pbin")
+	sample := officialSample(t)
 	official, err := os.ReadFile(sample)
 	if err != nil {
-		t.Skipf("official code.pbin not available: %v", err)
+		t.Fatalf("reading official sample: %v", err)
 	}
 
 	dir := t.TempDir()
@@ -423,10 +439,7 @@ func TestRunVerify(t *testing.T) {
 	}
 
 	// The official sample must pass every check.
-	sample := filepath.Join("..", ".vscode", "code.pbin")
-	if _, err := os.Stat(sample); err != nil {
-		t.Skipf("official code.pbin not available: %v", err)
-	}
+	sample := officialSample(t)
 	if code := run([]string{"verify", sample}); code != 0 {
 		t.Errorf("verify official sample: exit code = %d, want 0", code)
 	}
