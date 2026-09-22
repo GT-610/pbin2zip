@@ -3,6 +3,10 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"io"
 	"os"
 	"path/filepath"
@@ -360,6 +364,47 @@ func TestRunPackTemplate(t *testing.T) {
 	}
 	if code := run([]string{"verify", bnPbn}); code != 1 {
 		t.Errorf("verify gate-rewritten template: exit code = %d, want 1", code)
+	}
+}
+
+// TestRunPackSignIncludesBuildNumber pins the signing order: -sign used to
+// run before the -build-number gate rewrite, so the signature covered a
+// trailer that no longer existed on disk. The signature must verify against
+// the final written bytes.
+func TestRunPackSignIncludesBuildNumber(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := makeTestZip(t, dir)
+
+	key, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		t.Fatalf("generating RSA key: %v", err)
+	}
+	keyPath := filepath.Join(dir, "key.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatalf("writing key file: %v", err)
+	}
+
+	pbn := filepath.Join(dir, "signed.pbin")
+	if code := run([]string{"pack", "-sign", keyPath, "-build-number", "4242", "-o", pbn, zipPath}); code != 0 {
+		t.Fatalf("pack -sign -build-number exit code = %d, want 0", code)
+	}
+	data, err := os.ReadFile(pbn)
+	if err != nil {
+		t.Fatalf("reading packed container: %v", err)
+	}
+	f, err := pbin.Parse(data)
+	if err != nil {
+		t.Fatalf("parsing packed container: %v", err)
+	}
+	if build, ok := f.BuildNumber(); !ok || build != 4242 {
+		t.Fatalf("gate value = %d (ok=%v), want 4242", build, ok)
+	}
+	if err := f.Verify(&key.PublicKey); err != nil {
+		t.Fatalf("signature does not cover the final trailer: %v", err)
 	}
 }
 
