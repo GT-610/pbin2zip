@@ -20,12 +20,14 @@
 //     source): t = 1, total overhead 517 bytes. See
 //     utils/panzip/panzip.cpp (writer) and panorama/source2/
 //     panoramauiengine.cpp (PanoramaResourceFileIntegrityCheck, reader).
-//   - Version 2 (final 2023 client): t = 5 — four bytes of unknown purpose
-//     (never read back by any module) plus the version byte — total overhead
-//     521 bytes, minimum file size 581. Verified in the shipped
-//     panorama.dll parser (FUN_10011f80): magic 0x024E4150, payload at
-//     +0x204, length total-0x209, trailing byte == 2, mandatory RSA verify
-//     with a rotated public key (modulus starting 00 B0 9F D8 72...).
+//   - Version 2 (final 2023 client): t = 5 — four bytes of gate value plus
+//     the version byte — total overhead 521 bytes, minimum file size 581.
+//     Verified in the shipped panorama.dll parser (FUN_10011f80): magic
+//     0x024E4150, payload at +0x204, length total-0x209, trailing byte == 2,
+//     a pre-verify gate that reads the four trailer bytes back and compares
+//     them against a value supplied by INETSUPPORT_003 (official file:
+//     0x00003639 = 13881), then a mandatory RSA verify with a rotated
+//     public key (modulus starting 00 B0 9F D8 72..., exponent 17).
 //
 // Unpacking auto-detects the version from the header and locates the ZIP end
 // via the end-of-central-directory record, so it also copes with versions we
@@ -71,10 +73,19 @@ const (
 	// TrailerSizeV1: the version byte only.
 	TrailerSizeV1 = 1
 
-	// TrailerSizeV2: four bytes of unknown purpose plus the version byte.
-	// The final client's parser computes the payload length as total-0x209
-	// while the payload starts at +0x204, leaving exactly 5 trailing bytes.
+	// TrailerSizeV2: a four-byte gate value plus the version byte. The final
+	// client's parser computes the payload length as total-0x209 while the
+	// payload starts at +0x204, leaving exactly 5 trailing bytes, and reads
+	// the first four back as the gate value (see DefaultBuildNumber).
 	TrailerSizeV2 = 5
+
+	// DefaultBuildNumber is the four-byte gate value the final client
+	// expects: the parser reads trailer[0:4] as a little-endian uint32 and
+	// requires it to equal the value INETSUPPORT_003 reports, otherwise the
+	// container is rejected before signature verification. Valve's official
+	// final code.pbin carries 0x00003639 (13881), which pins the expected
+	// value for the frozen 2023 build.
+	DefaultBuildNumber = 0x00003639 // 13881
 
 	// MinSizeV2 is the smallest file the final client accepts
 	// (CMP ECX,0x245 in FUN_10011f80).
@@ -129,8 +140,8 @@ type File struct {
 	Zip []byte
 
 	// Trailer is everything between the end of the ZIP and EOF. Version 1
-	// files have 1 byte (the version), version 2 files have 5 bytes (4
-	// unknown bytes then the version). Preserved verbatim by Parse.
+	// files have 1 byte (the version), version 2 files have 5 bytes (the
+	// four-byte gate value then the version). Preserved verbatim by Parse.
 	Trailer []byte
 }
 
@@ -256,19 +267,44 @@ func (f *File) IsSigned() bool {
 	return false
 }
 
+// BuildNumberTrailer returns a version-2 trailer carrying the given gate
+// value (little-endian uint32) followed by the version byte.
+func BuildNumberTrailer(build, version uint32) []byte {
+	b := build
+	return []byte{byte(b), byte(b >> 8), byte(b >> 16), byte(b >> 24), byte(version)}
+}
+
 // defaultTrailer returns the trailer bytes written by Pack for a version.
 func defaultTrailer(version byte) []byte {
 	switch version {
 	case Version1:
 		return []byte{Version1}
 	case Version2:
-		// Four unknown bytes (never read back by the client, so zeroed)
-		// followed by the version byte, matching the final parser's
-		// total-0x209 payload length.
-		return []byte{0, 0, 0, 0, Version2}
+		// The official gate value (13881) so the final client's pre-verify
+		// gate passes; these four bytes are a gate value, not a content
+		// checksum.
+		return BuildNumberTrailer(DefaultBuildNumber, uint32(version))
 	default:
 		return []byte{version}
 	}
+}
+
+// BuildNumber reports the v2 trailer's gate value. ok is false when the
+// trailer is not the version-2 shape.
+func (f *File) BuildNumber() (build uint32, ok bool) {
+	if len(f.Trailer) != TrailerSizeV2 {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint32(f.Trailer[:4]), true
+}
+
+// SetBuildNumber overwrites the v2 trailer's gate value.
+func (f *File) SetBuildNumber(build uint32) error {
+	if len(f.Trailer) != TrailerSizeV2 {
+		return fmt.Errorf("pbin: gate value only exists in %d-byte (version 2) trailers, got %d", TrailerSizeV2, len(f.Trailer))
+	}
+	binary.LittleEndian.PutUint32(f.Trailer[:4], build)
+	return nil
 }
 
 // Pack builds a container around a ZIP payload with a zero placeholder

@@ -56,6 +56,11 @@ func TestOfficialSample(t *testing.T) {
 	if want := len(data) - OverheadSize - TrailerSizeV2; len(f.Zip) != want {
 		t.Errorf("len(Zip) = %d, want %d", len(f.Zip), want)
 	}
+	// The trailer's gate value must match what pack now emits by default;
+	// it is what the final client's pre-verify gate compares against.
+	if build, ok := f.BuildNumber(); !ok || build != DefaultBuildNumber {
+		t.Errorf("official gate value = %d (ok=%v), want DefaultBuildNumber %d", build, ok, DefaultBuildNumber)
+	}
 
 	// Re-marshaling must reproduce the official file byte for byte.
 	blob, err := f.MarshalBinary()

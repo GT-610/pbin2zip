@@ -113,8 +113,49 @@ func TestV2DefaultTrailer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pack: %v", err)
 	}
-	if want := []byte{0, 0, 0, 0, Version2}; !bytes.Equal(f.Trailer, want) {
+	// The final client's pre-verify gate compares trailer[0:4] against the
+	// value INETSUPPORT_003 reports; the official sample pins it to 13881.
+	if want := []byte{0x39, 0x36, 0x00, 0x00, Version2}; !bytes.Equal(f.Trailer, want) {
 		t.Errorf("v2 default trailer = %x, want %x", f.Trailer, want)
+	}
+	if build, ok := f.BuildNumber(); !ok || build != DefaultBuildNumber {
+		t.Errorf("BuildNumber() = %d, %v; want %d, true", build, ok, DefaultBuildNumber)
+	}
+}
+
+func TestSetBuildNumber(t *testing.T) {
+	f, err := Pack(sampleZip(t), Version2)
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	if err := f.SetBuildNumber(0x11223344); err != nil {
+		t.Fatalf("SetBuildNumber: %v", err)
+	}
+	if want := []byte{0x44, 0x33, 0x22, 0x11, Version2}; !bytes.Equal(f.Trailer, want) {
+		t.Errorf("trailer after SetBuildNumber = %x, want %x", f.Trailer, want)
+	}
+	blob, err := f.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	parsed, err := Parse(blob)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if build, _ := parsed.BuildNumber(); build != 0x11223344 {
+		t.Errorf("round-tripped gate value = %#x, want 0x11223344", build)
+	}
+
+	// Version 1 has no gate value.
+	f1, err := Pack(sampleZip(t), Version1)
+	if err != nil {
+		t.Fatalf("Pack v1: %v", err)
+	}
+	if _, ok := f1.BuildNumber(); ok {
+		t.Error("v1 trailer reports a gate value")
+	}
+	if err := f1.SetBuildNumber(1); err == nil {
+		t.Error("SetBuildNumber on v1 succeeded, want error")
 	}
 }
 
