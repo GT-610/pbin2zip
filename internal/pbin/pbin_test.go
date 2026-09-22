@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -38,6 +39,26 @@ func sampleZip(t *testing.T) []byte {
 		"panorama/styles.css": "body { color: red; }",
 		"panorama/script.js":  "const x = 1;",
 	})
+}
+
+var (
+	testKeyOnce sync.Once
+	testKey     *rsa.PrivateKey
+	testKeyErr  error
+)
+
+// sharedTestKey generates one 4096-bit RSA key per test binary. Key
+// generation dominates the runtime of the signing and key-loading tests,
+// and neither test needs a fresh key — only a stable one.
+func sharedTestKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	testKeyOnce.Do(func() {
+		testKey, testKeyErr = rsa.GenerateKey(rand.Reader, 4096)
+	})
+	if testKeyErr != nil {
+		t.Fatalf("generating RSA key: %v", testKeyErr)
+	}
+	return testKey
 }
 
 func TestRoundTrip(t *testing.T) {
@@ -316,10 +337,7 @@ func TestPackEnforcesMinSizeV2(t *testing.T) {
 }
 
 func TestSignAndVerify(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		t.Fatalf("generating RSA key: %v", err)
-	}
+	key := sharedTestKey(t)
 	zipData := sampleZip(t)
 
 	for _, version := range []byte{Version1, Version2} {
@@ -382,10 +400,7 @@ func TestSignAndVerify(t *testing.T) {
 }
 
 func TestLoadPrivateKey(t *testing.T) {
-	key, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		t.Fatalf("generating RSA key: %v", err)
-	}
+	key := sharedTestKey(t)
 
 	pkcs1 := pem.EncodeToMemory(&pem.Block{
 		Type:  "RSA PRIVATE KEY",
