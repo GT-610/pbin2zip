@@ -23,6 +23,7 @@ Usage:
   pbin2zip unpack [-o out.zip] <file.pbin | ->
   pbin2zip pack   [-o out.pbin] [-sign key.pem] [-version N] <file.zip | ->
   pbin2zip info   [-l] <file.pbin | ->
+  pbin2zip verify <file.pbin | ->
 
 Commands:
   unpack  strip the signed envelope, writing a plain ZIP; the container
@@ -31,6 +32,9 @@ Commands:
   pack    wrap a ZIP in a pbin container, targeting the final 2023 client
           (version 2) by default; zeroed signature unless -sign
   info    show container version, signature state, trailer, and ZIP contents
+  verify  check a container the way the stock final 2023 client would:
+          version-2 envelope, gate value 13881, official RSA signature;
+          exit 0 when the client would load it, exit 1 when it would not
 
 Options:
   -o string         output path (default: input with the other extension; "-" for stdout)
@@ -75,6 +79,8 @@ func run(args []string) int {
 		err = cmdPack(args[1:])
 	case "info":
 		err = cmdInfo(args[1:])
+	case "verify":
+		err = cmdVerify(args[1:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
 		return 0
@@ -196,6 +202,7 @@ func cmdPack(args []string) error {
 	}
 
 	var f *pbin.File
+	templateVerified := false
 	switch {
 	case *signPath != "":
 		keyPEM, err := os.ReadFile(*signPath)
@@ -236,7 +243,7 @@ func cmdPack(args []string) error {
 			if err := f.Verify(key); err != nil {
 				return fmt.Errorf("template envelope does not cover this ZIP: %w — the stock client would reject the output (input must be the template's original, unmodified ZIP)", err)
 			}
-			fmt.Fprintf(os.Stderr, "pbin2zip: template envelope verified against the official key; output is byte-identical to %s\n", displayName(*template))
+			templateVerified = true
 		} else {
 			fmt.Fprintf(os.Stderr, "pbin2zip: warning: template envelope copied but not verified (no embedded key for version %d)\n", f.Version)
 		}
@@ -250,6 +257,21 @@ func cmdPack(args []string) error {
 	if bnExplicit {
 		if err := f.SetBuildNumber(uint32(*buildNumber)); err != nil {
 			return err
+		}
+	}
+	if templateVerified {
+		// The gate value lives in the trailer, which is part of the signed
+		// range, so -build-number can invalidate a copied template signature.
+		// Verify once more after any gate rewrite and say which way the
+		// stock client would now treat the output.
+		key, err := pbin.OfficialPublicKey()
+		if err != nil {
+			return err
+		}
+		if err := f.Verify(key); err != nil {
+			fmt.Fprintf(os.Stderr, "pbin2zip: warning: the gate value set by -build-number breaks the copied signature (the trailer is signed too) — the stock client will reject this output\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "pbin2zip: template envelope verified against the official key; output is byte-identical to %s\n", displayName(*template))
 		}
 	}
 
@@ -335,6 +357,60 @@ func cmdInfo(args []string) error {
 		}
 	}
 	return nil
+}
+
+// cmdVerify checks a container against exactly what the stock final (2023)
+// client enforces, in the client's own order: a version-2 envelope, the gate
+// value INETSUPPORT_003 reports (13881 for the frozen build), and a valid
+// signature under Valve's embedded public key. Exit status 0 means the
+// client would accept the file, 1 means it would reject it.
+func cmdVerify(args []string) error {
+	fs := newFlagSet("verify")
+	if err := fs.Parse(args); err != nil {
+		return usageErrorf("%v\nusage: pbin2zip verify <file.pbin | ->", err)
+	}
+	if fs.NArg() != 1 {
+		return usageErrorf("verify expects exactly one input\nusage: pbin2zip verify <file.pbin | ->")
+	}
+	in := fs.Arg(0)
+
+	data, err := readInput(in)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", displayName(in), err)
+	}
+	f, err := pbin.Parse(data)
+	if err != nil {
+		return fmt.Errorf("%s: %w", displayName(in), err)
+	}
+
+	var problems []string
+	if f.Version != pbin.Version2 {
+		problems = append(problems, fmt.Sprintf("container version %d%s — the final client only reads version 2",
+			f.Version, versionLabel(f.Version)))
+	}
+	if build, ok := f.BuildNumber(); !ok {
+		problems = append(problems, "trailer carries no v2 gate value")
+	} else if build != pbin.DefaultBuildNumber {
+		problems = append(problems, fmt.Sprintf("gate value %d (0x%08x), the client expects %d (0x%08x)",
+			build, build, pbin.DefaultBuildNumber, pbin.DefaultBuildNumber))
+	}
+	key, err := pbin.OfficialPublicKey()
+	if err != nil {
+		return err
+	}
+	if err := f.Verify(key); err != nil {
+		problems = append(problems, err.Error())
+	}
+
+	if len(problems) == 0 {
+		fmt.Printf("%s: accepted — version 2, gate %d, official signature valid\n",
+			displayName(in), pbin.DefaultBuildNumber)
+		return nil
+	}
+	for _, p := range problems {
+		fmt.Fprintf(os.Stderr, "pbin2zip: %s: %s\n", displayName(in), p)
+	}
+	return fmt.Errorf("the stock 2023 client would reject this container (%d problem(s))", len(problems))
 }
 
 // readInput reads a file, treating "-" as stdin.

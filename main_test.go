@@ -265,6 +265,9 @@ func TestRunPackTemplate(t *testing.T) {
 	if !bytes.Equal(got, official) {
 		t.Fatalf("repacked container differs from the official file (%d vs %d bytes)", len(got), len(official))
 	}
+	if code := run([]string{"verify", repacked}); code != 0 {
+		t.Errorf("verify byte-identical repack: exit code = %d, want 0", code)
+	}
 
 	// A modified ZIP must be rejected: the template signature would not
 	// cover it and the stock client would refuse the output.
@@ -286,5 +289,73 @@ func TestRunPackTemplate(t *testing.T) {
 	}
 	if code := run([]string{"pack", "-template", sample, "-o", filepath.Join(dir, "mod.pbin"), modZip}); code != 1 {
 		t.Errorf("pack -template with modified zip: exit code = %d, want 1", code)
+	}
+
+	// The gate value is inside the signed range, so -build-number rewrites
+	// part of the signature payload: the pack still succeeds (research use)
+	// but verify must report that the stock client would reject the result.
+	bnPbn := filepath.Join(dir, "gate4242.pbin")
+	if code := run([]string{"pack", "-template", sample, "-build-number", "4242", "-o", bnPbn, zipPath}); code != 0 {
+		t.Fatalf("pack -template -build-number exit code = %d, want 0", code)
+	}
+	if code := run([]string{"verify", bnPbn}); code != 1 {
+		t.Errorf("verify gate-rewritten template: exit code = %d, want 1", code)
+	}
+}
+
+func TestRunVerify(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := makeTestZip(t, dir)
+
+	// Missing input is a usage error.
+	if code := run([]string{"verify"}); code != 2 {
+		t.Errorf("verify without input: exit code = %d, want 2", code)
+	}
+
+	// Garbage input is a normal failure, not a usage error.
+	notPbin := filepath.Join(dir, "not.pbin")
+	if err := os.WriteFile(notPbin, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("writing garbage input: %v", err)
+	}
+	if code := run([]string{"verify", notPbin}); code != 1 {
+		t.Errorf("verify garbage: exit code = %d, want 1", code)
+	}
+
+	// A default-packed container carries the right gate value but a zeroed
+	// signature: the stock client would reject it.
+	unsigned := filepath.Join(dir, "unsigned.pbin")
+	if code := run([]string{"pack", "-o", unsigned, zipPath}); code != 0 {
+		t.Fatalf("pack exit code = %d, want 0", code)
+	}
+	if code := run([]string{"verify", unsigned}); code != 1 {
+		t.Errorf("verify unsigned: exit code = %d, want 1", code)
+	}
+
+	// A wrong gate value must be reported (and fails regardless, since the
+	// zeroed signature also fails).
+	wrongGate := filepath.Join(dir, "wronggate.pbin")
+	if code := run([]string{"pack", "-build-number", "4242", "-o", wrongGate, zipPath}); code != 0 {
+		t.Fatalf("pack -build-number exit code = %d, want 0", code)
+	}
+	if code := run([]string{"verify", wrongGate}); code != 1 {
+		t.Errorf("verify wrong gate: exit code = %d, want 1", code)
+	}
+
+	// A legacy v1 container is not what the final client reads.
+	v1Path := filepath.Join(dir, "legacy.pbin")
+	if code := run([]string{"pack", "-version", "1", "-o", v1Path, zipPath}); code != 0 {
+		t.Fatalf("pack -version 1 exit code = %d, want 0", code)
+	}
+	if code := run([]string{"verify", v1Path}); code != 1 {
+		t.Errorf("verify v1 container: exit code = %d, want 1", code)
+	}
+
+	// The official sample must pass every check.
+	sample := filepath.Join("..", ".vscode", "code.pbin")
+	if _, err := os.Stat(sample); err != nil {
+		t.Skipf("official code.pbin not available: %v", err)
+	}
+	if code := run([]string{"verify", sample}); code != 0 {
+		t.Errorf("verify official sample: exit code = %d, want 0", code)
 	}
 }

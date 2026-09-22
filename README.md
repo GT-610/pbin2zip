@@ -58,6 +58,7 @@ warning-free ZIP — for version 1, version 2, and unknown versions alike.
 pbin2zip unpack [-o out.zip] <file.pbin | ->
 pbin2zip pack   [-o out.pbin] [-sign key.pem] [-version N] <file.zip | ->
 pbin2zip info   [-l] <file.pbin | ->
+pbin2zip verify <file.pbin | ->
 ```
 
 Examples:
@@ -70,6 +71,16 @@ unpacked 4704000 bytes of ZIP (726 entries) from code.pbin to code.zip \
 
 # inspect the container (version, signature state, trailer, entries)
 $ pbin2zip info -l code.pbin
+
+# check a container exactly the way the stock final client would:
+# version 2, gate 13881, official signature — exit 0 = accepted
+$ pbin2zip verify code.pbin
+code.pbin: accepted — version 2, gate 13881, official signature valid
+
+# a repacked file with a placeholder signature fails the same check
+$ pbin2zip verify modified.pbin
+pbin2zip: modified.pbin: signature verification failed: ...
+pbin2zip: error: the stock 2023 client would reject this container (1 problem(s))
 
 # repack a modified UI archive for the final 2023 client (version 2, the default)
 $ pbin2zip pack code.zip -o code.pbin
@@ -94,6 +105,8 @@ $ pbin2zip unpack - < code.pbin > code.zip
 - **pack** guarantees only the **2023 format (version 2)** — envelope size,
   trailer, and the 581-byte minimum are enforced. `-version 1` is also fully
   supported; any other version packs best-effort with a warning.
+- **verify** applies the stock client's checks in its own order and reports
+  each failing one; exit status 0 means the final client would load the file.
 
 ### Signature notes
 
@@ -107,8 +120,14 @@ $ pbin2zip unpack - < code.pbin > code.zip
   or for producing self-consistent fixtures.
 - The four non-version trailer bytes in v2 are covered by the signature and
   read back by the client as the pre-verify gate value; see below.
+- Because those gate bytes are signed, combining `-template` with a changed
+  `-build-number` invalidates the copied signature: `pack` warns about it and
+  `verify` reports the output as rejected (exit 1).
 
 ### Will the stock 2023 client read a packed file?
+
+Run `pbin2zip verify <file.pbin>` to check any container against exactly the
+rules below (exit 0 = accepted). In detail:
 
 - **Unmodified round trip: yes.** `pack -template` copies the official
   envelope and verifies it against the embedded official key, so the output
@@ -130,6 +149,8 @@ All of the above was cross-checked against Valve's unmodified final
 `code.pbin` (4,704,521 bytes, 726 entries, trailer `39 36 00 00 02`):
 
 - it parses, re-marshals byte-identically, and unpacks to a working ZIP;
+- it is byte-identical (same SHA-256) to the `code.pbin` shipped in a stock
+  Steam install of CS:GO Legacy, so the sample is provably unmodified;
 - its signature verifies against the public key extracted from the shipped
   `panorama.dll` — `tools/certcheck` reconstructs the 548-byte DER key from
   Ghidra-captured instruction bytes — confirming the signed range
