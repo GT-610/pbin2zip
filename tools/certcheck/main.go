@@ -184,7 +184,6 @@ func main() {
 		}{
 			{"[516, EOF) zip||trailer (panzip semantics)", data[516:]},
 			{"[516, EOF-5) zip only", data[516:zipEnd]},
-			{"[516, EOF-4) zip||version-byte", data[516 : zipEnd+1]},
 			{"[4, EOF) sig-included (sanity)", data[4:]},
 			{"[0, EOF) whole file (sanity)", data},
 		}
@@ -208,7 +207,6 @@ func main() {
 		t4, le32, le32, be32, be32, le16, le16, binary.LittleEndian.Uint16(t4[2:]))
 
 	zipData := data[516:zipEnd]
-	zipPlusVer := data[516:] // zip || trailer (last byte = version)
 
 	fmt.Println("\n--- trailer[0:4] candidate search ---")
 	targets := map[string]uint64{
@@ -222,8 +220,7 @@ func main() {
 	msgs := map[string][]byte{
 		"zip":           zipData,
 		"zip||trailer4": data[516 : zipEnd+4],
-		"zip||version":  zipPlusVer,
-		"from516":       data[516:],
+		"zip||trailer":  data[516:],
 		"wholeFile":     data,
 	}
 	// Uncompressed concatenation of all entries, region slices, and
