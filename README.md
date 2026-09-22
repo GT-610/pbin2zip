@@ -24,10 +24,10 @@ Two versions are known:
 
 | | Version 1 (up to 2019) | Version 2 (final 2023 client) |
 |---|---|---|
-| Trailer | 1 byte (the version) | 5 bytes (4 unknown + the version) |
+| Trailer | 1 byte (the version) | 5 bytes: 4-byte gate value + the version (official gate: `0x00003639` = 13881) |
 | Total overhead | 517 bytes | 521 bytes |
 | Minimum file size | 517 bytes | 581 bytes |
-| Public key | `C3 77 62 5E …` | rotated: `B0 9F D8 72 …` |
+| Public key | `C3 77 62 5E …` | rotated: `B0 9F D8 72 …`, exponent 17 |
 
 The version-1 layout comes from Valve's own packer and verifier in the leaked
 CS:GO source: `utils/panzip/panzip.cpp` (writer) and
@@ -42,8 +42,10 @@ MOV  dword [EBP+8], 0x24e4150  ; 'P','A','N',0x02 — version 2
 CMP  byte [EDX+ECX-1], 0x2     ; trailer must end with 0x02
 LEA  EAX, [EDX+0x204]          ; ZIP starts at +516
 SUB  EAX, 0x209                ; ZIP length = total-521 → 5-byte trailer
-                               ; then a mandatory RSA verify (512-byte
-                               ; signature at +4) with Valve's rotated key
+                               ; gate: read u32 at size-5 (trailer[0:4]),
+                               ; must equal INETSUPPORT_003's value, else
+                               ; reject before verifying the 512-byte
+                               ; RSA signature at +4 (rotated key)
 ```
 
 Stripping the fixed `516`-byte prefix and cutting at the ZIP's
@@ -71,6 +73,10 @@ $ pbin2zip info -l code.pbin
 
 # repack a modified UI archive for the final 2023 client (version 2, the default)
 $ pbin2zip pack code.zip -o code.pbin
+
+# unmodified round trip: reuse the official envelope so the output is
+# byte-identical to a Valve-signed file (verified against the official key)
+$ pbin2zip pack -template code.pbin code.zip -o repacked.pbin
 
 # legacy pre-2020 container
 $ pbin2zip pack -version 1 code.zip -o old-code.pbin
@@ -100,7 +106,23 @@ $ pbin2zip unpack - < code.pbin > code.zip
   over ZIP || trailer). Only useful for research against a patched verifier
   or for producing self-consistent fixtures.
 - The four non-version trailer bytes in v2 are covered by the signature and
-  never read back by any module of the final client; see below.
+  read back by the client as the pre-verify gate value; see below.
+
+### Will the stock 2023 client read a packed file?
+
+- **Unmodified round trip: yes.** `pack -template` copies the official
+  envelope and verifies it against the embedded official key, so the output
+  is byte-identical to Valve's own file (the test suite asserts this when
+  the local sample is present).
+- **Modified ZIP: not without patching the client.** The parser runs a
+  mandatory, fail-closed RSA verify (`FUN_10011f80`, verify call at
+  `panorama.dll` RVA `0x12548`) against Valve's rotated private-key
+  counterpart, which we do not have. Research setups patch the client —
+  e.g. replace that 5-byte `CALL` with `B8 01 00 00 00` (`MOV EAX,1`) —
+  or swap the embedded certificate; `-sign` then signs with your key.
+- Both cases still need the gate value correct (default 13881, tunable via
+  `-build-number`) and legal resource names/paths inside the ZIP: the
+  loader rejects illegal names and empty manifests.
 
 ## Verified against the official sample
 
@@ -117,12 +139,14 @@ All of the above was cross-checked against Valve's unmodified final
   the sample is present at `.vscode/code.pbin` (game content, not committed;
   override with `PBIN2ZIP_SAMPLE`) and skips otherwise.
 
-The four unknown trailer bytes are `39 36 00 00` in the official file. They
-are signed, unread by the client, and matched no candidate we tried:
-CRC32/CRC32C/Adler32 and CRC16 (ARC/CCITT/X.25/Kermit/Modbus, several init
-variants) over the ZIP, the central directory, the pre-EOCD region, the
-uncompressed concatenation, and per-entry CRC aggregates. `pack` therefore
-writes zeros there.
+The four trailer bytes are `39 36 00 00` — a little-endian uint32 of
+**13881**, not a content checksum: the parser seeks to `size-5`, reads them
+back, and compares them against the value `INETSUPPORT_003` reports, rejecting
+the file before the signature check if they differ (CRC32/CRC32C/Adler32 and
+CRC16 families over the ZIP, central directory, pre-EOCD region, uncompressed
+concatenation, and per-entry CRC aggregates all failed to match, confirming
+they are a gate value rather than a hash). `pack` writes 13881 by default —
+the value the frozen 2023 build expects — overridable with `-build-number`.
 
 ## Build and test
 
