@@ -25,24 +25,28 @@ Usage:
   pbin2zip info   [-l] <file.pbin | ->
 
 Commands:
-  unpack  strip the 516-byte pbin prefix and trailer, writing a plain ZIP
-  pack    wrap a ZIP in a pbin container (zeroed signature unless -sign)
-  info    show container version, signature state, and ZIP contents
+  unpack  strip the signed envelope, writing a plain ZIP; the container
+          version is auto-detected from the header (v1, v2, and unknown
+          versions all unpack)
+  pack    wrap a ZIP in a pbin container, targeting the final 2023 client
+          (version 2) by default; zeroed signature unless -sign
+  info    show container version, signature state, trailer, and ZIP contents
 
 Options:
   -o string      output path (default: input with the other extension; "-" for stdout)
   -sign string   RSA private key PEM (PKCS#1 or PKCS#8) used to sign the container
-  -version int   container version byte (default 1)
+  -version int   container version: 2 = final 2023 client (default), 1 = pre-2020
   -l             list every ZIP entry (info)
 
-A .pbin layout is 'PAN'+version, a 512-byte RSA-4096/SHA-1 signature, the ZIP
-payload, then the version byte again. Stripping the fixed 516-byte prefix (and
-the trailing byte) yields a valid ZIP, as described at
+Envelope layout (all versions): 'PAN'+version header, 512-byte RSA-4096/SHA-1
+signature over everything after the prefix, the ZIP, then a trailer ending
+with the version byte — 1 byte for v1, 5 bytes for v2. The fixed 516-byte
+prefix is what "remove the first 516 bytes" strips:
 https://www.unknowncheats.me/forum/2157360-post2.html
 
-Note: the game verifies the signature with Valve's embedded public key, so a
-container packed without Valve's private key fails that check; use -sign only
-for research against a patched verifier.
+Note: the 2023 client verifies the signature with Valve's embedded (rotated)
+public key, so a container packed without Valve's private key fails that
+check; use -sign only for research against a patched verifier.
 `
 
 func main() {
@@ -136,8 +140,8 @@ func cmdUnpack(args []string) error {
 		return fmt.Errorf("writing %s: %w", displayOut(*out), err)
 	}
 
-	fmt.Fprintf(os.Stderr, "unpacked %d bytes of ZIP (%d entries) from %s to %s\n",
-		len(f.Zip), len(entries), displayName(in), displayOut(*out))
+	fmt.Fprintf(os.Stderr, "unpacked %d bytes of ZIP (%d entries) from %s to %s (container version %d, %d-byte trailer)\n",
+		len(f.Zip), len(entries), displayName(in), displayOut(*out), f.Version, len(f.Trailer))
 	return nil
 }
 
@@ -145,7 +149,7 @@ func cmdPack(args []string) error {
 	fs := newFlagSet("pack")
 	out := fs.String("o", "", "output pbin path (`-` for stdout)")
 	signPath := fs.String("sign", "", "RSA private key PEM used to sign the container")
-	version := fs.Int("version", int(pbin.DefaultVersion), "container version byte")
+	version := fs.Int("version", int(pbin.DefaultVersion), "container version (2 = final 2023 client, 1 = pre-2020)")
 	if err := fs.Parse(args); err != nil {
 		return usageErrorf("%v\nusage: pbin2zip pack [-o out.pbin] [-sign key.pem] [-version N] <file.zip | ->", err)
 	}
@@ -154,6 +158,9 @@ func cmdPack(args []string) error {
 	}
 	if *version <= 0 || *version > 255 {
 		return usageErrorf("-version must be between 1 and 255, got %d", *version)
+	}
+	if *version != pbin.Version1 && *version != pbin.Version2 {
+		fmt.Fprintf(os.Stderr, "pbin2zip: warning: container version %d is not verified against any known client; output is best-effort\n", *version)
 	}
 	in := fs.Arg(0)
 
@@ -181,7 +188,10 @@ func cmdPack(args []string) error {
 			return err
 		}
 	} else {
-		f = pbin.Pack(data, byte(*version))
+		f, err = pbin.Pack(data, byte(*version))
+		if err != nil {
+			return err
+		}
 		fmt.Fprintln(os.Stderr, "pbin2zip: warning: packing with a zeroed signature; the game's integrity check will reject this container")
 	}
 
@@ -205,8 +215,8 @@ func cmdPack(args []string) error {
 	if f.IsSigned() {
 		state = "signed"
 	}
-	fmt.Fprintf(os.Stderr, "packed %d ZIP entries (%d payload bytes) from %s to %s (%d bytes, %s)\n",
-		len(zr.File), len(data), displayName(in), displayOut(*out), len(blob), state)
+	fmt.Fprintf(os.Stderr, "packed %d ZIP entries (%d payload bytes) from %s to %s (%d bytes, version %d, %s)\n",
+		len(zr.File), len(data), displayName(in), displayOut(*out), len(blob), f.Version, state)
 	return nil
 }
 
@@ -231,15 +241,19 @@ func cmdInfo(args []string) error {
 	}
 
 	sum := sha256.Sum256(f.Signature)
+	trailerNote := "expected: unknown version"
+	if expected := pbin.ExpectedTrailerSize(f.Version); expected >= 0 {
+		trailerNote = fmt.Sprintf("expected %d", expected)
+	}
 	fmt.Printf("file:        %s\n", displayName(in))
 	fmt.Printf("size:        %d bytes\n", len(data))
-	fmt.Printf("version:     %d\n", f.Version)
+	fmt.Printf("version:     %d%s\n", f.Version, versionLabel(f.Version))
 	fmt.Printf("signature:   %d bytes, sha256:%x\n", len(f.Signature), sum)
 	if !f.IsSigned() {
 		fmt.Printf("             (all-zero placeholder, container is unsigned)\n")
 	}
-	fmt.Printf("zip payload: %d bytes (prefix: %d, trailer: %d)\n",
-		len(f.Zip), pbin.OverheadSize, pbin.TrailerSize)
+	fmt.Printf("zip payload: %d bytes (prefix: %d, trailer: %d bytes, %s): %x\n",
+		len(f.Zip), pbin.OverheadSize, len(f.Trailer), trailerNote, f.Trailer)
 
 	entries, err := f.ZipEntries()
 	if err != nil {
@@ -291,6 +305,18 @@ func displayName(path string) string {
 		return "<stdin>"
 	}
 	return path
+}
+
+// versionLabel names the container versions we can vouch for.
+func versionLabel(version byte) string {
+	switch version {
+	case pbin.Version1:
+		return " (pre-2020 client)"
+	case pbin.Version2:
+		return " (final 2023 client)"
+	default:
+		return " (unknown)"
+	}
 }
 
 // displayOut is displayName for output paths.
