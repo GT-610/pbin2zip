@@ -282,14 +282,19 @@ func cmdPack(args []string) error {
 	}
 	if templateVerified {
 		// The gate value lives in the trailer, which is part of the signed
-		// range, so -build-number can invalidate a copied template signature.
-		// Verify once more after any gate rewrite and say which way the
-		// stock client would now treat the output.
-		key, err := pbin.OfficialPublicKey()
-		if err != nil {
-			return err
+		// range, so -build-number can invalidate the copied signature. When
+		// the gate was not rewritten the verification done above still
+		// stands — re-running it would only hash and check the whole
+		// multi-megabyte payload a second time.
+		broken := false
+		if bnExplicit {
+			key, err := pbin.OfficialPublicKey()
+			if err != nil {
+				return err
+			}
+			broken = f.Verify(key) != nil
 		}
-		if err := f.Verify(key); err != nil {
+		if broken {
 			fmt.Fprintf(os.Stderr, "pbin2zip: warning: the gate value set by -build-number breaks the copied signature (the trailer is signed too) — the stock client will reject this output\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "pbin2zip: template envelope verified against the official key; output is byte-identical to %s\n", displayName(*template))
