@@ -221,19 +221,18 @@ func cmdPack(args []string) error {
 		}
 	}
 
-	var f *pbin.File
+	// Build the common envelope once; the branches below only decide what
+	// goes into the signature field.
+	f, err := pbin.Pack(data, byte(*version))
+	if err != nil {
+		return err
+	}
 	templateVerified := false
 	switch {
 	case *signPath != "":
-		f, err = pbin.Pack(data, byte(*version))
-		if err != nil {
-			return err
-		}
+		// The signature field keeps Pack's zero placeholder until the gate
+		// rewrite below has settled the final bytes to sign.
 	case *template != "":
-		f, err = pbin.Pack(data, byte(*version))
-		if err != nil {
-			return err
-		}
 		refData, err := os.ReadFile(*template)
 		if err != nil {
 			return fmt.Errorf("reading template %s: %w", *template, err)
@@ -260,10 +259,6 @@ func cmdPack(args []string) error {
 			fmt.Fprintf(os.Stderr, "pbin2zip: warning: template envelope copied but not verified (no embedded key for version %d)\n", f.Version)
 		}
 	default:
-		f, err = pbin.Pack(data, byte(*version))
-		if err != nil {
-			return err
-		}
 		fmt.Fprintln(os.Stderr, "pbin2zip: warning: packing with a zeroed signature; the stock game will reject this container (use -template for unmodified round trips, or patch the verifier for research)")
 	}
 	if bnExplicit {
