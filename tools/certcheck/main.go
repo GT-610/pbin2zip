@@ -24,6 +24,7 @@ import (
 	"crypto/sha1"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"hash/adler32"
 	"hash/crc32"
@@ -37,23 +38,9 @@ import (
 const codeHex = "c785dcfdffff30820220c785e0fdffff300d0609c785e4fdffff2a864886c785e8fdfffff70d0101c785ecfdffff01050003c785f0fdffff82020d00c785f4fdffff30820208c785f8fdffff02820201c785fcfdffff00b09fd8c78500feffff723e5f79c78504feffff2889fa2fc78508feffffadf6b189c7850cfeffffe3fc21acc78510feffff0548f0e5c78514feffffe8290a2ac78518feffff570e8f74c7851cfeffff0c03c70fc78520feffff59e70fc5c78524feffffc4857c20c78528feffff9348f5a7c7852cfeffffc4668773c78530feffff42d10db8c78534feffff37e6f42cc78538feffff7b746cb0c7853cfeffffb8e9d256c78540feffffa80870c1c78544feffff87b8f67cc78548feffff84277a4ec7854cfeffff2d2722c7c78550feffff255beb80c78554feffffdc5f5b8dc78558feffffb06d6839c7855cfeffff590da0a8c78560feffff2182085fc78564feffff94e26b44c78568feffff8b453a2dc7856cfeffffe7e21863c78570fefffff3c1e3e7c78574feffff59bb1f9cc78578feffff4d0ed256c7857cfeffff83c2c49ec78580feffffc23f4353c78584feffffd04c0f74c78588feffffdb15e9eec7858cfeffff0358171ec78590feffffe05231d5c78594feffff27c1cfccc78598feffff28a5f263c7859cfeffff4956aed9c785a0feffffe2a1926fc785a4feffff23260e9ec785a8feffff4558e937c785acfeffffec56f679c785b0feffffea206194c785b4feffffb705ea35c785b8feffff4a28b448c785bcfeffff548310bac785c0feffff40ce93a7c785c4feffffba3ea7ccc785c8feffffefc27f45c785ccfeffff51b8e5abc785d0feffff91ba3cffc785d4feffff38068f5bc785d8feffffece993f5c785dcfeffff1b3d20b4c785e0feffff32ccd0b6c785e4feffff1378c2d4c785e8feffff4cd7e170c785ecfeffff987e43b0c785f0feffff9dc2b9b2c785f4feffffaf308a03c785f8feffff20130966c785fcfeffffb197204ac78500ffffff57b7c792c78504ffffff42c63901c78508ffffff39fc2c71c7850cffffff4ec955c0c78510ffffffc4285124c78514ffffffb1e689b6c78518ffffff4a12201bc7851cfffffffbaf57af8b075183c004c78520ffffff9709886150518b0b8d85dcfdffff508b4510c78524ffffff5aba4f9ac78528ffffff47f32697c7852cffffff72fc97498b1083c205c78530ffffff424fbe4bc78534ffffff43ac604ac78538fffffffced4d7bc7853cffffffb573d4dac78540ffffff5dc29219c78544ffffffae3bd5c1c78548ffffff40611295c7854cffffffa4fa5234c78550fffffff0c2bb53c78554ffffffd3812ad6c78558ffffff63806bf7c7855cffffff71756d96c78560fffffff6c88fbdc78564ffffff56722511c78568ffffffc54297dcc7856cffffffc930e50cc78570ffffffdd1b46b5c78574ffffff8e2ca3b9c78578ffffff1363479ac7857cffffff3e8b0799c7458076135300c745843a0d127ec745888254dcb9c7458c490e6306c74590b1c98835c745946d75de61c745985efeac71c7459c16b0dd72c745a0ed602dabc745a4ae82833ec745a82f29bb07c745ac592fbce1c745b0cb0748bdc745b4f9e6777dc745b8873d1ab8c745bcbf6b99abc745c0ea5dbb6cc745c45b92292dc745c8e1a9b6e7c745cc4058fe16c745d038ed4284c745d4dc6f8b1ec745d80800bd76c745dce0a295e2c745e0c4a3a6e8c745e432c78900c745e82ab7b3dec745ecb488f6d5c745f0b0ba89a7c745f4ecaf7044c745f86e50349cc745fc75020111e8131a0000"
 
 func mustHex(s string) []byte {
-	out := make([]byte, len(s)/2)
-	for i := 0; i < len(out); i++ {
-		var b byte
-		for k := 0; k < 2; k++ {
-			c := s[2*i+k]
-			var v byte
-			switch {
-			case c >= '0' && c <= '9':
-				v = c - '0'
-			case c >= 'a' && c <= 'f':
-				v = c - 'a' + 10
-			default:
-				panic("bad hex")
-			}
-			b = b<<4 | v
-		}
-		out[i] = b
+	out, err := hex.DecodeString(s)
+	if err != nil {
+		panic("bad hex: " + err.Error())
 	}
 	return out
 }
@@ -62,16 +49,7 @@ func mustHex(s string) []byte {
 // (EBP-0x224 .. EBP-0x84, step 4) then 32 x C7 45 disp8
 // (EBP-0x80 .. EBP-0x4, step 4), collecting the 137 immediates = 548 bytes.
 func extractCert(code []byte) ([]byte, error) {
-	hexOf := func(b []byte) string {
-		const digits = "0123456789abcdef"
-		s := make([]byte, len(b)*2)
-		for i, v := range b {
-			s[2*i] = digits[v>>4]
-			s[2*i+1] = digits[v&0xf]
-		}
-		return string(s)
-	}
-	src := hexOf(code)
+	src := hex.EncodeToString(code)
 
 	var cert []byte
 	pos := 0
@@ -88,7 +66,7 @@ func extractCert(code []byte) ([]byte, error) {
 	for v := -0x224; v <= -0x84; v += 4 {
 		var d [4]byte
 		binary.LittleEndian.PutUint32(d[:], uint32(int32(v)))
-		pat := "c785" + hexOf(d[:])
+		pat := "c785" + hex.EncodeToString(d[:])
 		i, err := find(pat)
 		if err != nil {
 			return nil, err
