@@ -400,16 +400,19 @@ func cmdVerify(args []string) error {
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", displayName(in), err)
 	}
+	// The client's first gate is CMP ECX,0x245: reject below the 581-byte
+	// floor before parsing, so even structurally invalid tiny files get the
+	// diagnostic the stock client would act on.
+	if len(data) < pbin.MinSizeV2 {
+		return fmt.Errorf("%s: file is %d bytes, the final client requires at least %d",
+			displayName(in), len(data), pbin.MinSizeV2)
+	}
 	f, err := pbin.Parse(data)
 	if err != nil {
 		return fmt.Errorf("%s: %w", displayName(in), err)
 	}
 
 	var problems []string
-	if len(data) < pbin.MinSizeV2 {
-		problems = append(problems, fmt.Sprintf("file is %d bytes, the final client requires at least %d",
-			len(data), pbin.MinSizeV2))
-	}
 	if f.Version != pbin.Version2 {
 		problems = append(problems, fmt.Sprintf("container version %d%s — the final client only reads version 2",
 			f.Version, versionLabel(f.Version)))
