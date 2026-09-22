@@ -338,9 +338,9 @@ func crc16ArcInit(data []byte, init uint16) uint16 {
 	return crc
 }
 
-// crc16Kermit: reflected CCITT (poly 0x8408), init 0.
-func crc16Kermit(data []byte) uint16 {
-	var crc uint16
+// crc16Refl runs a reflected CCITT CRC (poly 0x8408) from the given init value.
+func crc16Refl(data []byte, init uint16) uint16 {
+	crc := init
 	for _, b := range data {
 		crc ^= uint16(b)
 		for i := 0; i < 8; i++ {
@@ -352,6 +352,17 @@ func crc16Kermit(data []byte) uint16 {
 		}
 	}
 	return crc
+}
+
+// crc16Kermit: reflected CCITT (poly 0x8408), init 0.
+func crc16Kermit(data []byte) uint16 {
+	return crc16Refl(data, 0)
+}
+
+// crc16X25: CRC-16/X-25 (IBM-SDLC): reflected CCITT, init 0xffff, final
+// complement.
+func crc16X25(data []byte) uint16 {
+	return ^crc16Refl(data, 0xFFFF)
 }
 
 func crc16Ccitt(data []byte, init uint16) uint16 {
@@ -367,12 +378,4 @@ func crc16Ccitt(data []byte, init uint16) uint16 {
 		}
 	}
 	return crc
-}
-
-func crc16X25(data []byte) uint16 {
-	return ^crc16ArcInner(data)
-}
-
-func crc16ArcInner(data []byte) uint16 {
-	return crc16ArcInit(data, 0)
 }
